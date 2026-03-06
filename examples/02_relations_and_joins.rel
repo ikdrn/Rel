@@ -1,0 +1,223 @@
+#!rel 0.1
+--
+-- Rel Language Examples: 02 — Relations & Joins
+-- リレーション探索とJOINの新しい書き方
+--
+
+-- ============================================================
+-- 1. 基本的なリレーション探索（INNER JOIN相当）
+-- ============================================================
+
+-- SQL:
+--   SELECT orders.id, users.name
+--   FROM orders
+--   JOIN users ON orders.user_id = users.id
+
+-- Rel:
+from orders -> user
+|> select { orders.id, user.name }
+
+-- 同じことをnavigate演算子で:
+from orders
+|> navigate .user
+|> select { orders.id, user.name }
+
+
+-- ============================================================
+-- 2. 連鎖するリレーション探索
+-- ============================================================
+
+-- SQL:
+--   SELECT orders.id, users.name, addresses.city
+--   FROM orders
+--   JOIN users ON orders.user_id = users.id
+--   JOIN addresses ON users.address_id = addresses.id
+
+-- Rel:
+from orders -> user -> address
+|> select {
+     order_id:  orders.id,
+     user_name: user.name,
+     city:      address.city
+   }
+
+
+-- ============================================================
+-- 3. オプショナルリレーション（LEFT JOIN相当）
+-- ============================================================
+
+-- SQL:
+--   SELECT orders.id, coupons.code
+--   FROM orders
+--   LEFT JOIN coupons ON orders.coupon_id = coupons.id
+
+-- Rel:
+from orders -?> coupon
+|> select {
+     order_id:    orders.id,
+     coupon_code: coupon?.code ?? "NO_COUPON"
+   }
+
+
+-- ============================================================
+-- 4. 複合リレーション（INNER + LEFT JOIN混在）
+-- ============================================================
+
+-- 注文 → ユーザー（必須）→ クーポン（任意）
+from orders -> user -?> coupon
+|> where user.status == "active"
+|> select {
+     orders.id,
+     user.name,
+     discount: coupon?.discount_rate ?? 0.0
+   }
+
+
+-- ============================================================
+-- 5. 多対多のリレーション探索
+-- ============================================================
+
+-- ユーザーのタグ（中間テーブル user_tags を自動解決）
+from users -> tags
+|> group by users.id, users.name
+|> select {
+     id:   users.id,
+     name: users.name,
+     tags: collect(tags.name)
+   }
+
+-- 特定のタグを持つユーザー
+from users -> tags
+|> where tags.name == "premium"
+|> select { users.id, users.name, users.email }
+
+
+-- ============================================================
+-- 6. 逆方向リレーション探索
+-- ============================================================
+
+-- ユーザー → そのユーザーの注文（1対多）
+from users <- orders
+|> group by users.id, users.name
+|> select {
+     user_id:     users.id,
+     user_name:   users.name,
+     order_count: count(orders.id),
+     total_spent: sum(orders.amount)
+   }
+
+
+-- ============================================================
+-- 7. FULL OUTER JOIN相当
+-- ============================================================
+
+-- 全ユーザーと全注文（対応なしも含む）
+from users <-> orders
+|> select {
+     user_id:   users?.id,
+     user_name: users?.name,
+     order_id:  orders?.id,
+     amount:    orders?.amount
+   }
+
+
+-- ============================================================
+-- 8. 再帰的リレーション探索（組織階層）
+-- ============================================================
+
+-- SQL (WITH RECURSIVE):
+--   WITH RECURSIVE sub AS (
+--     SELECT id, name, manager_id, 0 AS depth
+--     FROM employees WHERE id = $root_id
+--     UNION ALL
+--     SELECT e.id, e.name, e.manager_id, s.depth + 1
+--     FROM employees e JOIN sub s ON e.manager_id = s.id
+--     WHERE s.depth < 10
+--   )
+--   SELECT * FROM sub
+
+-- Rel:
+from employees
+|> where .id == $root_id
+|> follow ~> reports(depth: 0..10)
+|> select { .id, .name, .depth, .manager_id }
+
+-- カテゴリの全祖先を取得
+from categories
+|> where .id == $leaf_id
+|> follow ~> parent(depth: 0..20)
+|> order by .depth desc
+|> select { .id, .name, .depth }
+
+
+-- ============================================================
+-- 9. 複雑なリレーション + 集計
+-- ============================================================
+
+-- 国別・カテゴリ別売上（複数テーブル結合 + 集計）
+from orders -> user -> order_items -> product -> category
+|> where orders.status != "cancelled"
+|> where user.is_verified == true
+|> group by user.country, category.name
+|> select {
+     country:       user.country,
+     category:      category.name,
+     total_revenue: sum(order_items.quantity * product.price),
+     order_count:   count(distinct orders.id),
+     avg_order_val: avg(orders.amount)
+   }
+|> order by user.country, total_revenue desc
+
+
+-- ============================================================
+-- 10. 同一エンティティへの複数リレーション
+-- ============================================================
+
+-- 注文の「作成者」と「承認者」が両方ともUsersテーブルを参照
+
+-- スキーマ定義（参考）:
+--   entity Order {
+--     created_by: UUID -> User.id
+--     approved_by: UUID? -> User.id
+--   }
+--   relation Order.creator  -> User via Order.created_by
+--   relation Order.approver -> User? via Order.approved_by
+
+from orders -> creator -?> approver
+|> select {
+     orders.id,
+     creator_name:  creator.name,
+     approver_name: approver?.name ?? "未承認"
+   }
+
+
+-- ============================================================
+-- 11. サブクエリ（パイプライン内）
+-- ============================================================
+
+-- SQL: SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 10000)
+
+-- Rel（パイプラインで平坦に記述）:
+let high_value_user_ids =
+  from orders
+  |> where .amount > 10000
+  |> select .user_id
+  |> distinct by .user_id
+
+from users
+|> where .id in high_value_user_ids
+|> select { .id, .name, .email }
+
+
+-- ============================================================
+-- 12. 自己JOIN（Self Join）
+-- ============================================================
+
+-- 同じ国のユーザーペアを見つける（自己JOIN）
+from users as u1 -> users as u2
+  on u1.country == u2.country and u1.id < u2.id
+|> select {
+     user1: u1.name,
+     user2: u2.name,
+     country: u1.country
+   }

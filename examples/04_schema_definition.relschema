@@ -1,0 +1,431 @@
+#!rel 0.1
+--
+-- Rel Schema Examples: 04 — Schema Definition
+-- エンティティ定義・リレーション定義の完全な例
+--
+
+module ecommerce {
+
+-- ============================================================
+-- 1. カスタム型定義
+-- ============================================================
+
+-- 基本型エイリアス
+type UserId    = UUID
+type ProductId = UUID
+type OrderId   = UUID
+type Email     = String  @validate(is_email)
+type Url       = String  @validate(is_url)
+type Price     = Decimal(10,2) @check(value >= 0)
+type Quantity  = Int @check(value >= 0)
+
+-- 住所型（埋め込み型）
+type Address = {
+  street:   String,
+  city:     String,
+  state:    String?,
+  zip:      String,
+  country:  String   -- ISO 3166-1 alpha-2
+}
+
+-- 地理座標型
+type GeoPoint = {
+  lat: Float,
+  lon: Float
+}
+
+-- 通貨型
+type Money = {
+  amount:   Decimal(18,4),
+  currency: String          -- ISO 4217 (USD, JPY, EUR, ...)
+}
+
+
+-- ============================================================
+-- 2. Enum定義
+-- ============================================================
+
+enum UserStatus {
+  Active    = "active"
+  Inactive  = "inactive"
+  Suspended = "suspended"
+  Deleted   = "deleted"
+}
+
+enum OrderStatus {
+  Draft      = "draft"
+  Pending    = "pending"
+  Processing = "processing"
+  Shipped    = "shipped"
+  Delivered  = "delivered"
+  Cancelled  = "cancelled"
+  Refunded   = "refunded"
+}
+
+enum PaymentStatus {
+  Pending   = "pending"
+  Captured  = "captured"
+  Failed    = "failed"
+  Refunded  = "refunded"
+}
+
+enum ProductCondition {
+  New         = "new"
+  LikeNew     = "like_new"
+  Good        = "good"
+  Acceptable  = "acceptable"
+}
+
+enum NotificationChannel {
+  Email = "email"
+  SMS   = "sms"
+  Push  = "push"
+  All   = "all"
+}
+
+
+-- ============================================================
+-- 3. 代数的データ型（ADT）
+-- ============================================================
+
+-- 注文の詳細なステータス（状態ごとに異なるデータを持つ）
+type OrderStatusDetail =
+  | Draft
+  | Pending    { submitted_at: Timestamp }
+  | Processing { started_at: Timestamp, assigned_to: UUID? }
+  | Shipped    { tracking_number: String, carrier: String, shipped_at: Timestamp }
+  | Delivered  { delivered_at: Timestamp, signature: String? }
+  | Cancelled  { cancelled_at: Timestamp, reason: String, refund_amount: Price? }
+  | Refunded   { refunded_at: Timestamp, refund_id: String }
+
+-- 支払い方法
+type PaymentMethodDetail =
+  | CreditCard { last_four: String, brand: String, expires_at: String }
+  | BankTransfer { bank_name: String, account_last_four: String }
+  | Crypto { currency: String, wallet_address: String }
+  | Cash
+
+
+-- ============================================================
+-- 4. エンティティ定義
+-- ============================================================
+
+-- ユーザー
+entity User {
+  id:            UserId        @primary @default(gen_uuid_v7())
+  email:         Email         @unique @index
+  name:          String(200)   @required
+  display_name:  String(100)?
+  avatar_url:    Url?
+  phone:         String?       @index
+  status:        UserStatus    @default(UserStatus.Active) @index
+  country:       String?
+  address:       Address?      -- 埋め込み型
+  locale:        String        @default("ja-JP")
+  timezone:      String        @default("Asia/Tokyo")
+  is_verified:   Bool          @default(false)
+  metadata:      Json          @default({})
+
+  -- 時刻フィールド
+  created_at:    Timestamp     @default(now())
+  updated_at:    Timestamp     @auto_update(now())
+  last_login_at: Timestamp?
+  deleted_at:    Timestamp?    @index
+
+  -- テーブルレベルの制約
+  @check(name != "")
+  @index([country, status])
+  @index([created_at desc])
+}
+
+-- 商品カテゴリ（ツリー構造）
+entity Category {
+  id:          UUID     @primary @default(gen_uuid_v7())
+  name:        String   @required
+  slug:        String   @unique
+  description: String?
+  image_url:   Url?
+  parent_id:   UUID?
+  sort_order:  Int      @default(0)
+  is_active:   Bool     @default(true)
+  metadata:    Json     @default({})
+
+  created_at:  Timestamp @default(now())
+  updated_at:  Timestamp @auto_update(now())
+
+  @index([parent_id])
+  @index([slug])
+}
+
+-- 商品
+entity Product {
+  id:            ProductId     @primary @default(gen_uuid_v7())
+  category_id:   UUID          @index
+  seller_id:     UserId        @index
+  name:          String(500)   @required
+  description:   Text?
+  price:         Price         @check(price >= 0)
+  original_price: Price?
+  stock:         Quantity      @default(0)
+  sku:           String?       @unique
+  barcode:       String?       @index
+  condition:     ProductCondition @default(ProductCondition.New)
+  images:        List<Url>     @default([])
+  tags:          List<String>  @default([])
+  attributes:    Map<String, Json> @default({})
+  is_active:     Bool          @default(true)
+  weight_g:      Int?          -- グラム単位
+  dimensions:    Json?         -- {w, h, d} cm単位
+
+  created_at:    Timestamp     @default(now())
+  updated_at:    Timestamp     @auto_update(now())
+  deleted_at:    Timestamp?
+
+  @index([category_id, is_active])
+  @index([seller_id])
+  @index([price])
+  @index([created_at desc])
+  @check(stock >= 0)
+  @check(price >= 0)
+}
+
+-- 注文
+entity Order {
+  id:              OrderId    @primary @default(gen_uuid_v7())
+  user_id:         UserId     @index
+  status:          OrderStatus @default(OrderStatus.Pending) @index
+  status_detail:   OrderStatusDetail?
+  subtotal:        Price
+  shipping_fee:    Price      @default(0)
+  tax_amount:      Price      @default(0)
+  discount_amount: Price      @default(0)
+  total_amount:    Price
+  currency:        String     @default("JPY")
+  shipping_address: Address
+  notes:           String?
+  metadata:        Json       @default({})
+
+  created_at:      Timestamp  @default(now())
+  updated_at:      Timestamp  @auto_update(now())
+  completed_at:    Timestamp?
+
+  @index([user_id, status])
+  @index([created_at desc])
+  @check(total_amount >= 0)
+}
+
+-- 注文アイテム
+entity OrderItem {
+  id:          UUID        @primary @default(gen_uuid_v7())
+  order_id:    OrderId     @index
+  product_id:  ProductId
+  quantity:    Quantity    @check(quantity > 0)
+  unit_price:  Price
+  total_price: Price       @computed(quantity * unit_price)
+  snapshot:    Json        -- 注文時点の商品情報スナップショット
+
+  created_at:  Timestamp   @default(now())
+
+  @index([order_id])
+  @index([product_id])
+}
+
+-- 支払い
+entity Payment {
+  id:             UUID          @primary @default(gen_uuid_v7())
+  order_id:       OrderId       @unique
+  method:         PaymentMethodDetail
+  status:         PaymentStatus @default(PaymentStatus.Pending) @index
+  amount:         Price
+  currency:       String
+  external_id:    String?       @index  -- 外部決済サービスのID
+  captured_at:    Timestamp?
+  failed_at:      Timestamp?
+  failure_reason: String?
+  metadata:       Json          @default({})
+
+  created_at:     Timestamp     @default(now())
+  updated_at:     Timestamp     @auto_update(now())
+}
+
+-- タグ
+entity Tag {
+  id:         UUID    @primary @default(gen_uuid_v7())
+  name:       String  @unique
+  slug:       String  @unique
+  color:      String? -- HEXカラーコード
+  created_at: Timestamp @default(now())
+}
+
+-- レビュー
+entity Review {
+  id:          UUID      @primary @default(gen_uuid_v7())
+  product_id:  ProductId @index
+  user_id:     UserId    @index
+  order_id:    OrderId?
+  rating:      Int       @check(rating >= 1 and rating <= 5)
+  title:       String?
+  body:        Text?
+  images:      List<Url> @default([])
+  is_verified: Bool      @default(false)  -- 実際に購入したか
+  helpful_count: Int     @default(0)
+  created_at:  Timestamp @default(now())
+  updated_at:  Timestamp @auto_update(now())
+
+  @index([product_id, rating])
+  @index([user_id])
+}
+
+-- 通知設定
+entity UserNotificationSettings {
+  user_id:   UserId   @primary
+  channel:   NotificationChannel @default(NotificationChannel.Email)
+  order_updates:    Bool @default(true)
+  promotions:       Bool @default(false)
+  product_updates:  Bool @default(true)
+  security_alerts:  Bool @default(true)
+  updated_at:       Timestamp @auto_update(now())
+}
+
+
+-- ============================================================
+-- 5. リレーション定義
+-- ============================================================
+
+-- User のリレーション
+relation User.orders             -> Order[]                  via Order.user_id
+relation User.reviews            -> Review[]                 via Review.user_id
+relation User.notification_settings -> UserNotificationSettings? via UserNotificationSettings.user_id
+
+-- アクティブな注文のみのリレーション（条件付き）
+relation User.active_orders -> Order[]
+  via Order.user_id
+  where Order.status in [OrderStatus.Pending, OrderStatus.Processing, OrderStatus.Shipped]
+
+-- Category のリレーション（自己参照ツリー）
+relation Category.parent    -> Category?   via Category.parent_id
+relation Category.children  -> Category[]  via Category.parent_id
+relation Category.products  -> Product[]   via Product.category_id
+relation Category.ancestors -> Category[]  recursive via Category.parent_id
+
+-- Product のリレーション
+relation Product.category   -> Category    via Product.category_id
+relation Product.seller     -> User        via Product.seller_id
+relation Product.order_items -> OrderItem[] via OrderItem.product_id
+relation Product.reviews    -> Review[]    via Review.product_id
+
+-- Product ↔ Tag （多対多）
+relation Product.tags <-> Tag[] via ProductTag {
+  product_id: ProductId -> Product.id
+  tag_id:     UUID      -> Tag.id
+  created_at: Timestamp @default(now())
+}
+
+-- Order のリレーション
+relation Order.user         -> User        via Order.user_id
+relation Order.items        -> OrderItem[] via OrderItem.order_id
+relation Order.payment      -> Payment?    via Payment.order_id
+
+-- OrderItem のリレーション
+relation OrderItem.order    -> Order       via OrderItem.order_id
+relation OrderItem.product  -> Product     via OrderItem.product_id
+
+-- Review のリレーション
+relation Review.product     -> Product     via Review.product_id
+relation Review.user        -> User        via Review.user_id
+relation Review.order       -> Order?      via Review.order_id
+
+
+-- ============================================================
+-- 6. シャーディング設定
+-- ============================================================
+
+-- 注文テーブルは user_id でシャーディング
+entity Order {
+  @shard(
+    strategy: hash,
+    key:      .user_id,
+    count:    256,
+    replicas: 3
+  )
+}
+
+-- 時系列データは範囲シャーディング
+entity Event {
+  id:         UUID      @primary
+  user_id:    UserId
+  event_type: String
+  payload:    Json
+  occurred_at: Timestamp @index
+
+  @shard(
+    strategy: range,
+    key:      .occurred_at,
+    ranges: [
+      { before: "2024-01-01", group: "cold" },
+      { before: "2025-01-01", group: "warm" },
+      { from:   "2025-01-01", group: "hot" }
+    ]
+  )
+  @index([user_id, occurred_at desc])
+  @index([event_type, occurred_at desc])
+}
+
+
+-- ============================================================
+-- 7. マイグレーション定義
+-- ============================================================
+
+migration initial_schema_v1 {
+  version:     "2026-03-06-001"
+  description: "Initial ecommerce schema"
+
+  up {
+    create User
+    create Category
+    create Product
+    create ProductTag
+    create Order
+    create OrderItem
+    create Payment
+    create Tag
+    create Review
+    create UserNotificationSettings
+    create Event
+  }
+
+  down {
+    drop Event
+    drop UserNotificationSettings
+    drop Review
+    drop Tag
+    drop Payment
+    drop OrderItem
+    drop Order
+    drop ProductTag
+    drop Product
+    drop Category
+    drop User
+  }
+}
+
+migration add_product_weight_v2 {
+  version:     "2026-03-06-002"
+  description: "Add weight and dimensions to Product"
+
+  up {
+    alter Product {
+      add weight_g:   Int?
+      add dimensions: Json?
+    }
+  }
+
+  down {
+    alter Product {
+      drop weight_g
+      drop dimensions
+    }
+  }
+}
+
+} -- end module ecommerce

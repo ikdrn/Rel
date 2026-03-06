@@ -1,0 +1,216 @@
+#!rel 0.1
+--
+-- Rel Language Examples: 01 — Basic Queries
+-- SQLとの対応を示す基本的なクエリ例
+--
+
+-- ============================================================
+-- 1. 最もシンプルなSELECT
+-- ============================================================
+
+-- SQL:   SELECT * FROM users
+-- Rel:
+from users
+
+-- SQL:   SELECT name FROM users WHERE age > 18
+-- Rel:
+from users
+|> where .age > 18
+|> select .name
+
+-- SQL:   SELECT id, name, email FROM users
+-- Rel:
+from users
+|> select { .id, .name, .email }
+
+-- SQL:   SELECT id, name, (age * 2) AS double_age FROM users
+-- Rel:
+from users
+|> select {
+     .id,
+     .name,
+     double_age: .age * 2
+   }
+
+
+-- ============================================================
+-- 2. WHERE句の条件式
+-- ============================================================
+
+-- 等号比較
+from users
+|> where .status == "active"
+
+-- 複数条件 (AND)
+from users
+|> where .age > 18 and .country == "Japan"
+
+-- 複数条件 (OR)
+from users
+|> where .status == "active" or .status == "premium"
+
+-- IN句
+from users
+|> where .country in ["Japan", "Korea", "Singapore"]
+
+-- NOT IN
+from users
+|> where .status not in ["deleted", "suspended"]
+
+-- LIKE相当（パターンマッチ）
+from users
+|> where .name like "山%"
+
+-- 範囲条件
+from products
+|> where .price >= 1000 and .price <= 5000
+
+-- Optionalフィールドのチェック（IS NOT NULL相当）
+from users
+|> where .phone != None
+
+-- Optionalフィールドが存在する場合の値チェック
+from users
+|> where .phone?.starts_with("+81") == Some(true)
+
+
+-- ============================================================
+-- 3. 計算フィールドと関数呼び出し
+-- ============================================================
+
+from orders
+|> select {
+     .id,
+     .amount,
+     tax:         .amount * 0.1,
+     total:       .amount * 1.1,
+     created_day: date(.created_at),
+     label:       "Order #" ++ .id.to_string()
+   }
+
+
+-- ============================================================
+-- 4. 文字列操作
+-- ============================================================
+
+import std.string { upper, lower, trim, split, length, replace }
+
+from users
+|> select {
+     .id,
+     name_upper:    upper(.name),
+     email_domain:  split(.email, "@")[1],
+     name_length:   length(.name),
+     trimmed_bio:   trim(.bio ?? "")
+   }
+
+
+-- ============================================================
+-- 5. 日付・時刻操作
+-- ============================================================
+
+import std.datetime { now, today, date_trunc, date_diff, format_date }
+
+-- 過去30日のレコード
+from orders
+|> where .created_at >= now() - 30.days
+|> select { .id, .amount, .created_at }
+
+-- 日付の切り捨て
+from events
+|> select {
+     hour:  date_trunc("hour",  .occurred_at),
+     day:   date_trunc("day",   .occurred_at),
+     month: date_trunc("month", .occurred_at),
+     year:  date_trunc("year",  .occurred_at)
+   }
+
+-- 日付差分
+from users
+|> select {
+     .id,
+     .name,
+     days_since_signup: date_diff("day", .created_at, now())
+   }
+
+
+-- ============================================================
+-- 6. IF式（CASE WHEN相当）
+-- ============================================================
+
+-- SQL: CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END
+-- Rel:
+from users
+|> select {
+     .name,
+     category: if .age >= 18 then "adult" else "minor"
+   }
+
+-- ネストしたIF
+from products
+|> select {
+     .name,
+     .price,
+     tier: if .price >= 10000 then "premium"
+           else if .price >= 5000 then "standard"
+           else "budget"
+   }
+
+
+-- ============================================================
+-- 7. パターンマッチング
+-- ============================================================
+
+-- Enumに対するマッチ
+from orders
+|> select {
+     .id,
+     status_label: match .status {
+       OrderStatus.Pending    => "受付中",
+       OrderStatus.Processing => "処理中",
+       OrderStatus.Shipped    => "発送済み",
+       OrderStatus.Delivered  => "配達完了",
+       OrderStatus.Cancelled  => "キャンセル",
+     }
+   }
+
+-- Option型に対するマッチ
+from users
+|> select {
+     .name,
+     contact: match .phone {
+       Some(p) => "TEL: " ++ p,
+       None    => "Email: " ++ .email
+     }
+   }
+
+
+-- ============================================================
+-- 8. DISTINCT
+-- ============================================================
+
+-- SQL: SELECT DISTINCT country FROM users
+-- Rel:
+from users
+|> distinct by .country
+|> select .country
+
+-- 複数フィールドでのDISTINCT
+from orders
+|> distinct by (.user_id, .product_id)
+|> select { .user_id, .product_id }
+
+
+-- ============================================================
+-- 9. EXISTS / NOT EXISTS相当
+-- ============================================================
+
+-- 注文が存在するユーザーのみ
+from users
+|> where exists(from orders |> where .user_id == users.id)
+|> select { .id, .name }
+
+-- 一度も注文していないユーザー
+from users
+|> where not exists(from orders |> where .user_id == users.id)
+|> select { .id, .name }
