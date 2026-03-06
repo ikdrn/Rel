@@ -1,216 +1,213 @@
-#!rel 0.1
+#!rel 0.2
 --
 -- Rel Language Examples: 01 — Basic Queries
--- SQLとの対応を示す基本的なクエリ例
+-- select/from/where は存在しない。
+-- エンティティパターン + => 抽出で記述する。
 --
 
+
 -- ============================================================
--- 1. 最もシンプルなSELECT
+-- 1. エンティティパターンの基本
 -- ============================================================
 
--- SQL:   SELECT * FROM users
--- Rel:
-from users
+-- すべてのユーザー（FROM users に相当するが、テーブルではなくエンティティ）
+User
 
--- SQL:   SELECT name FROM users WHERE age > 18
--- Rel:
-from users
-|> where .age > 18
-|> select .name
+-- 条件付き（WHERE は使わない。{} の中に書く）
+User { age > 18 }
 
--- SQL:   SELECT id, name, email FROM users
--- Rel:
-from users
-|> select { .id, .name, .email }
+-- 複数条件（AND はカンマ）
+User { age > 18, country: "Japan" }
 
--- SQL:   SELECT id, name, (age * 2) AS double_age FROM users
--- Rel:
-from users
-|> select {
-     .id,
-     .name,
-     double_age: .age * 2
-   }
+-- OR 条件
+User { country: "Japan" | country: "Korea" }
+
+-- ネストした AND/OR
+User { age >= 18, plan: "premium" | plan: "enterprise" }
 
 
 -- ============================================================
--- 2. WHERE句の条件式
+-- 2. フィールド抽出（SELECT の代わりに => を使う）
 -- ============================================================
 
--- 等号比較
-from users
-|> where .status == "active"
+-- 全フィールド
+User { age > 18 }
+=> .
 
--- 複数条件 (AND)
-from users
-|> where .age > 18 and .country == "Japan"
+-- 特定フィールドを選ぶ
+User { age > 18 }
+=> { .id, .name, .email }
 
--- 複数条件 (OR)
-from users
-|> where .status == "active" or .status == "premium"
+-- フィールドに別名をつける
+User { age > 18 }
+=> { id: .id, full_name: .name, contact: .email }
 
--- IN句
-from users
-|> where .country in ["Japan", "Korea", "Singapore"]
+-- 計算フィールド
+User
+=> { .name, label: .name ++ " (" ++ .country ++ ")" }
 
--- NOT IN
-from users
-|> where .status not in ["deleted", "suspended"]
-
--- LIKE相当（パターンマッチ）
-from users
-|> where .name like "山%"
-
--- 範囲条件
-from products
-|> where .price >= 1000 and .price <= 5000
-
--- Optionalフィールドのチェック（IS NOT NULL相当）
-from users
-|> where .phone != None
-
--- Optionalフィールドが存在する場合の値チェック
-from users
-|> where .phone?.starts_with("+81") == Some(true)
+-- 条件式（三項演算子）
+User
+=> {
+  .name,
+  .age,
+  tier: .age >= 65 ? "senior" : .age >= 18 ? "adult" : "minor"
+}
 
 
 -- ============================================================
--- 3. 計算フィールドと関数呼び出し
+-- 3. パターン記法の詳細
 -- ============================================================
 
-from orders
-|> select {
-     .id,
-     .amount,
-     tax:         .amount * 0.1,
-     total:       .amount * 1.1,
-     created_day: date(.created_at),
-     label:       "Order #" ++ .id.to_string()
-   }
+-- 一致チェック（: は == と同じ）
+User { status: Active }
 
+-- 比較演算子
+User { price >= 1000, price <= 5000 }
 
--- ============================================================
--- 4. 文字列操作
--- ============================================================
+-- Option フィールドの存在チェック
+User { phone: Some }          -- phone が存在する（IS NOT NULL 相当）
+User { phone: None }          -- phone が存在しない（IS NULL 相当）
 
-import std.string { upper, lower, trim, split, length, replace }
+-- リストに含まれる
+User { country: in ["Japan", "Korea", "Singapore"] }
 
-from users
-|> select {
-     .id,
-     name_upper:    upper(.name),
-     email_domain:  split(.email, "@")[1],
-     name_length:   length(.name),
-     trimmed_bio:   trim(.bio ?? "")
-   }
+-- 正規表現
+User { name: ~ /^田/ }
+
+-- リレーション先の存在チェック
+User { has(.orders) }         -- 注文がある
+User { lacks(.orders) }       -- 一度も注文していない
+User { .orders.count > 3 }    -- 3件より多い注文がある
 
 
 -- ============================================================
--- 5. 日付・時刻操作
+-- 4. ソートとページング
 -- ============================================================
 
-import std.datetime { now, today, date_trunc, date_diff, format_date }
+-- ソート
+User { age > 18 }
+sort (.name asc)
+=> { .id, .name }
 
--- 過去30日のレコード
-from orders
-|> where .created_at >= now() - 30.days
-|> select { .id, .amount, .created_at }
+-- 複数ソート
+User
+sort (.country asc, .age desc)
+=> { .name, .country, .age }
 
--- 日付の切り捨て
-from events
-|> select {
-     hour:  date_trunc("hour",  .occurred_at),
-     day:   date_trunc("day",   .occurred_at),
-     month: date_trunc("month", .occurred_at),
-     year:  date_trunc("year",  .occurred_at)
-   }
+-- ページング（オフセットベース）
+User { age > 18 }
+sort (.created_at desc)
+take 20, skip 40
+=> { .id, .name }
 
--- 日付差分
-from users
-|> select {
-     .id,
-     .name,
-     days_since_signup: date_diff("day", .created_at, now())
-   }
+-- ページング（カーソルベース、分散環境推奨）
+User
+sort (.created_at desc, .id desc)
+after $cursor
+take 20
+=> { .id, .name, .created_at }
 
+-- 1件だけ取得
+User { id: $id } one
+=> { .id, .name, .email }
 
--- ============================================================
--- 6. IF式（CASE WHEN相当）
--- ============================================================
-
--- SQL: CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END
--- Rel:
-from users
-|> select {
-     .name,
-     category: if .age >= 18 then "adult" else "minor"
-   }
-
--- ネストしたIF
-from products
-|> select {
-     .name,
-     .price,
-     tier: if .price >= 10000 then "premium"
-           else if .price >= 5000 then "standard"
-           else "budget"
-   }
+-- 最初の1件（存在しない場合は None）
+User { email: $email } first
+=> { .id, .name }
 
 
 -- ============================================================
--- 7. パターンマッチング
+-- 5. 日時・計算を使ったパターン
 -- ============================================================
 
--- Enumに対するマッチ
-from orders
-|> select {
-     .id,
-     status_label: match .status {
-       OrderStatus.Pending    => "受付中",
-       OrderStatus.Processing => "処理中",
-       OrderStatus.Shipped    => "発送済み",
-       OrderStatus.Delivered  => "配達完了",
-       OrderStatus.Cancelled  => "キャンセル",
-     }
-   }
+import std.time.*
 
--- Option型に対するマッチ
-from users
-|> select {
-     .name,
-     contact: match .phone {
-       Some(p) => "TEL: " ++ p,
-       None    => "Email: " ++ .email
-     }
-   }
+-- 過去30日以内に作成されたユーザー
+User { created_at > now() - 30d }
+=> { .id, .name, .created_at }
+
+-- 過去1年以内に更新されていないユーザー
+User { updated_at < now() - 365d, status: Active }
+=> { .id, .name, .updated_at }
 
 
 -- ============================================================
--- 8. DISTINCT
+-- 6. 文字列操作
 -- ============================================================
+
+import std.string.*
+
+User { age > 18 }
+=> {
+  .id,
+  name_upper:   upper(.name),
+  email_domain: split(.email, "@")[1],
+  name_len:     length(.name)
+}
+
+
+-- ============================================================
+-- 7. Optionの操作
+-- ============================================================
+
+User
+=> {
+  .name,
+  -- None のときはデフォルト値
+  phone:    .phone ?? "未登録",
+  -- オプショナルチェーン（None なら None のまま）
+  phone_up: .phone?.to_upper() ?? "N/A"
+}
+
+-- パターンマッチ
+User { age > 18 }
+=> {
+  .name,
+  contact: .phone match {
+    Some(p) => "TEL: " ++ p,
+    None    => "Email: " ++ .email
+  }
+}
+
+
+-- ============================================================
+-- 8. 配列フィールドの操作
+-- ============================================================
+
+Product { is_active: true }
+=> {
+  .id,
+  .name,
+  .tags,
+  has_sale_tag:  .tags.contains("sale"),
+  tag_count:     .tags.length(),
+  first_tag:     .tags.first() ?? "none"
+}
+
+
+-- ============================================================
+-- 9. SQLとの直接対応
+-- ============================================================
+
+-- SQL: SELECT id, name FROM users WHERE age > 18 ORDER BY name LIMIT 10
+User { age > 18 }
+sort (.name)
+take 10
+=> { .id, .name }
 
 -- SQL: SELECT DISTINCT country FROM users
--- Rel:
-from users
-|> distinct by .country
-|> select .country
+User
+sort (.country)
+=> { .country }  -- per(.country) で重複除外になる（後述）
 
--- 複数フィールドでのDISTINCT
-from orders
-|> distinct by (.user_id, .product_id)
-|> select { .user_id, .product_id }
+-- SQL: SELECT COUNT(*) FROM users WHERE status = 'active'
+User { status: Active } count()
 
+-- SQL: SELECT * FROM users WHERE phone IS NOT NULL
+User { phone: Some }
+=> .
 
--- ============================================================
--- 9. EXISTS / NOT EXISTS相当
--- ============================================================
-
--- 注文が存在するユーザーのみ
-from users
-|> where exists(from orders |> where .user_id == users.id)
-|> select { .id, .name }
-
--- 一度も注文していないユーザー
-from users
-|> where not exists(from orders |> where .user_id == users.id)
-|> select { .id, .name }
+-- SQL: SELECT *, COALESCE(phone, 'N/A') FROM users
+User
+=> { ., phone_display: .phone ?? "N/A" }

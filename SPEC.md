@@ -1,566 +1,582 @@
 # Rel — Relation Language
-## 次世代データベース言語 完全設計仕様書
+## 次世代データベース言語 設計仕様書 v0.2
 
-**バージョン**: 0.1.0-draft
+**バージョン**: 0.2.0-draft
 **設計日**: 2026-03-06
-**ステータス**: RFC (Request for Comments)
+**ステータス**: RFC
+
+---
+
+## なぜSQLを捨てるのか
+
+SQLの「本当の問題」はキーワードの順序ではない。
+
+**問題の本質: SQLは「テーブル走査」という誤った世界観に基づいている。**
+
+現実のデータはこういう構造をしている:
+
+```
+User ─── orders ──→ Order ─── items ──→ Product ─── category ──→ Category
+  │
+  └── address ──→ Address
+  └── tags ──→ Tag (多対多)
+```
+
+しかしSQLはこのグラフを、まず全部バラバラの2次元テーブルに押し込み、
+クエリのたびにJOINで「関係を手動で再構築する」という歪な設計になっている。
+
+Relは**エンティティとその関係をそのまま記述する**。
+テーブルもJOINも、SELECT/FROM/WHEREも存在しない。
 
 ---
 
 ## 目次
 
-1. [言語名と概要](#1-言語名と概要)
-2. [言語の哲学](#2-言語の哲学)
-3. [基本クエリ構文](#3-基本クエリ構文)
-4. [JOINの再発明 — リレーション探索](#4-joinの再発明--リレーション探索)
-5. [GROUP BY / 集計](#5-group-by--集計)
-6. [ORDER / LIMIT / PAGINATION](#6-order--limit--pagination)
+1. [言語の世界観](#1-言語の世界観)
+2. [基本構文：エンティティパターン](#2-基本構文エンティティパターン)
+3. [リレーション探索](#3-リレーション探索)
+4. [形状の抽出](#4-形状の抽出)
+5. [集計](#5-集計)
+6. [ソートとページング](#6-ソートとページング)
 7. [スキーマ定義](#7-スキーマ定義)
 8. [リレーション定義](#8-リレーション定義)
 9. [型システム](#9-型システム)
-10. [クエリの再利用](#10-クエリの再利用)
-11. [モジュールシステム](#11-モジュールシステム)
-12. [実行モデル](#12-実行モデル)
-13. [分散クエリ](#13-分散クエリ)
-14. [SQLとの比較](#14-sqlとの比較)
+10. [名前付きパターン（再利用）](#10-名前付きパターン再利用)
+11. [モジュール](#11-モジュール)
+12. [書き込み操作](#12-書き込み操作)
+13. [実行モデル](#13-実行モデル)
+14. [分散・ストリーム](#14-分散ストリーム)
+15. [SQLとの対比](#15-sqlとの対比)
 
 ---
 
-## 1. 言語名と概要
+## 1. 言語の世界観
 
-### 言語名: **Rel**
-**Rel** = **Rel**ation Language
-
-### コアコンセプト
+### データはグラフである
 
 ```
-Rel は「データの流れ」を表現する言語である。
-SQLが「何を取得するか」を宣言するのに対して、
-Relは「どのようにデータが流れるか」を記述する。
+┌────────────────────────────────────────────────────────────────┐
+│  SQLの世界観                    Relの世界観                    │
+│                                                                │
+│  users テーブル                 User エンティティ              │
+│  ┌──┬──────┬─────┐             ┌────────────────────┐         │
+│  │id│name  │cntry│             │  User              │         │
+│  ├──┼──────┼─────┤             │  ├── id: UUID      │         │
+│  │1 │Alice │JP   │             │  ├── name: String  │         │
+│  │2 │Bob   │US   │             │  ├── country: Str  │         │
+│  └──┴──────┴─────┘             │  ├── .orders ──────┼──→ Order│
+│                                │  └── .address ─────┼──→ Addr │
+│  orders テーブル               └────────────────────┘         │
+│  ┌──┬───────┬───────┐                                          │
+│  │id│user_id│amount │          ※ エンティティが主役。          │
+│  ├──┼───────┼───────┤            テーブルは実装の詳細。        │
+│  │10│  1   │ 5000  │            JOINは不要。                   │
+│  └──┴───────┴───────┘                                          │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-### ファイル拡張子
-- `.rel`  — クエリファイル
-- `.relschema` — スキーマ定義ファイル
-- `.relmod` — モジュールファイル
+### Relの基本構造
 
-### バージョニング
+```
+エンティティパターン { 制約 } -> .リレーション -> エンティティパターン { 制約 }
+  => 抽出する形状
+```
+
+演算子は3つだけ覚えればよい:
+
+```
+{ }   エンティティのパターンマッチ（制約）
+->    リレーション探索（グラフ走査）
+=>    結果の形状を定義（抽出）
+```
+
+---
+
+## 2. 基本構文：エンティティパターン
+
+### 2.1 エンティティを直接指定する
+
+SQLに`FROM users`はない。エンティティ名を書くだけ。
+
 ```rel
-#!rel 0.1
+-- すべてのユーザー
+User
+
+-- 条件付き（WHEREもない。{}の中に書く）
+User { age > 18 }
+
+-- 複数条件（ANDはカンマ、ORは|）
+User { age > 18, country: "Japan" }
+
+-- OR条件
+User { country: "Japan" | country: "Korea" }
+
+-- ネストした条件
+User { age > 18, status: Active, plan: "premium" | plan: "enterprise" }
 ```
 
----
+### 2.2 パターンの記法
 
-## 2. 言語の哲学
+```rel
+-- フィールド一致（== と同じ）
+User { country: "Japan" }
 
-### 2.1 設計思想
+-- 比較演算子
+User { age > 18 }
+User { price >= 1000, price <= 5000 }
+User { name != "admin" }
 
-Relは以下の7つの原則に基づいて設計された。
+-- Optionフィールドの存在チェック
+User { phone: Some }          -- phoneが存在する
+User { phone: None }          -- phoneが存在しない
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Rel Design Pillars                   │
-├─────────────────────────────────────────────────────────┤
-│  1. FLOW       データは左から右へ流れる                 │
-│  2. SAFETY     型安全、null安全が言語レベルで保証        │
-│  3. COMPOSE    クエリは関数のように合成できる           │
-│  4. RELATE     リレーションは一級市民である             │
-│  5. DISTRIBUTE 分散処理はネイティブに組み込まれている   │
-│  6. READABLE   コードは散文のように読める               │
-│  7. MINIMAL    構文は最小限、表現力は最大限             │
-└─────────────────────────────────────────────────────────┘
-```
+-- リストの中に含まれる
+User { country: in ["Japan", "Korea", "Singapore"] }
 
-### 2.2 SQLとの根本的な違い
+-- 正規表現マッチ
+User { name: ~ /^田/ }
 
-| 観点 | SQL | Rel |
-|------|-----|-----|
-| 記述パラダイム | 宣言的（結果を指定） | データフロー型（変換を記述） |
-| 読み順 | SELECT→FROM→WHERE（実行順と逆） | FROM→FILTER→SELECT（実行順と一致） |
-| NULL処理 | 三値論理（true/false/null） | Option型（Some/None） |
-| 型システム | 弱い型（暗黙キャスト多発） | 強い静的型＋型推論 |
-| JOIN | キーワードとON句の組み合わせ | リレーション探索演算子 |
-| 再利用 | ビュー・ストアドプロシージャ | first-class query |
-| モジュール | スキーマ単位のみ | module/namespace/import |
-| 分散処理 | 拡張機能・方言依存 | ネイティブ組み込み |
-| エラー | ランタイムエラー多発 | コンパイル時に多くを検出 |
-
-### 2.3 解決する問題
-
-```
-Problem 1: 書く順序と実行順序の不一致
-  SQL:  SELECT name FROM users WHERE age > 18
-        ↑第3段階   ↑第1段階  ↑第2段階
-  Rel:  users |> where age > 18 |> select name
-        ↑第1段階   ↑第2段階       ↑第3段階
-
-Problem 2: JOINの複雑さ
-  SQL:  FROM orders JOIN users ON orders.user_id = users.id
-  Rel:  orders -> user   (リレーションが定義済みなら自動解決)
-
-Problem 3: NULLの三値論理
-  SQL:  NULL != NULL  → NULL (!)
-  Rel:  None != None  → false (Option型で明示的に扱う)
-
-Problem 4: ネストしたサブクエリ
-  SQL:  SELECT * FROM (SELECT * FROM (SELECT ...))
-  Rel:  パイプラインで平坦に記述
-
-Problem 5: 型安全性の欠如
-  SQL:  age + 'hello'  → 実行時エラーまたは暗黙変換
-  Rel:  age + 'hello'  → コンパイルエラー (Int + String は不正)
+-- 存在チェック（リレーション経由）
+User { has(.orders) }         -- 注文がある
+User { lacks(.orders) }       -- 注文がない
+User { .orders.count > 3 }    -- 注文が3件より多い
 ```
 
----
+### 2.3 SQLとの対比
 
-## 3. 基本クエリ構文
-
-### 3.1 構文の基本形
-
-Relのクエリは **パイプライン演算子 `|>`** を使って記述する。
-
-```
-<source> |> <operator> |> <operator> |> ... |> <output>
-```
-
-### 3.2 SQLとの比較
-
-**SQL:**
 ```sql
-SELECT name
-FROM users
-WHERE age > 18
+-- SQL
+SELECT * FROM users WHERE age > 18 AND country = 'Japan'
 ```
-
-**Rel:**
-```rel
-from users
-|> where .age > 18
-|> select .name
-```
-
-### 3.3 構文の詳細説明
 
 ```rel
--- 1. データソースを指定
-from users
-
--- 2. フィルタリング（パイプで接続）
-|> where .age > 18
-
--- 3. フィールド選択
-|> select .name
-```
-
-**ドット記法**: `.field` は現在のレコードのフィールドを参照する。
-
-### 3.4 複数フィールドの選択
-
-```rel
-from users
-|> where .age > 18
-|> select {
-     id:   .id,
-     name: .name,
-     age:  .age
-   }
-```
-
-**省略記法**: フィールド名と変数名が同じ場合は省略可能
-```rel
-from users
-|> where .age > 18
-|> select { .id, .name, .age }
-```
-
-### 3.5 フィールドの変換（computed fields）
-
-```rel
-from users
-|> where .age > 18
-|> select {
-     .name,
-     full_label: .name ++ " (age: " ++ .age.to_string() ++ ")"
-   }
-```
-
-### 3.6 完全な構文図
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Query Pipeline                                              │
-│                                                              │
-│  from <source>                                               │
-│    │                                                         │
-│    ▼                                                         │
-│  |> where <predicate>         ← filter rows                  │
-│    │                                                         │
-│    ▼                                                         │
-│  |> join / navigate           ← traverse relations           │
-│    │                                                         │
-│    ▼                                                         │
-│  |> group by <fields>         ← aggregation                  │
-│    │                                                         │
-│    ▼                                                         │
-│  |> having <predicate>        ← filter after group           │
-│    │                                                         │
-│    ▼                                                         │
-│  |> order by <fields>         ← sorting                      │
-│    │                                                         │
-│    ▼                                                         │
-│  |> take <n> skip <m>         ← pagination                   │
-│    │                                                         │
-│    ▼                                                         │
-│  |> select <projection>       ← output shape                 │
-└──────────────────────────────────────────────────────────────┘
+-- Rel: FROM なし、WHERE なし、SELECT なし
+User { age > 18, country: "Japan" }
 ```
 
 ---
 
-## 4. JOINの再発明 — リレーション探索
+## 3. リレーション探索
 
-### 4.1 設計思想
+### 3.1 矢印でグラフを辿る
 
-SQLのJOINは「どのキーで結合するか」をクエリのたびに記述する。
-Relでは **リレーションをスキーマに定義し、クエリ時は探索するだけ**。
-
-```
-SQLのアプローチ: JOIN users ON orders.user_id = users.id
-Relのアプローチ: orders -> user   (リレーションは事前定義済み)
-```
-
-### 4.2 SQLとの比較
-
-**SQL:**
-```sql
-SELECT orders.id, users.name
-FROM orders
-JOIN users ON orders.user_id = users.id
-```
-
-**Rel:**
-```rel
-from orders
-|> navigate .user          -- リレーション探索
-|> select { orders.id, user.name }
-```
-
-または **矢印記法**（インライン）:
-```rel
-from orders -> user
-|> select { orders.id, user.name }
-```
-
-### 4.3 ナビゲーション演算子
-
-```
-演算子   意味                          対応するSQL
-─────────────────────────────────────────────────────────
-->       INNER JOIN (存在するもののみ)   INNER JOIN
--?>      LEFT JOIN (任意のリレーション)  LEFT JOIN
-<-       逆方向のリレーション探索        逆JOIN
-<->      双方向探索                     FULL OUTER JOIN
-~>       グラフ探索（再帰）             WITH RECURSIVE
-```
-
-### 4.4 複数リレーションの連鎖
+JOINもON句もない。リレーションは事前にスキーマで定義されているので、辿るだけ。
 
 ```rel
--- orders → user → address の3段階リレーション
-from orders -> user -> address
-|> where address.country == "Japan"
-|> select {
-     order_id:    orders.id,
-     user_name:   user.name,
-     city:        address.city
-   }
+-- ユーザーとその注文
+User { country: "Japan" } -> .orders -> Order { amount > 1000 }
+
+-- 3段階の探索
+User -> .orders -> .items -> Product { category: "Electronics" }
+
+-- 4段階
+User -> .orders -> .items -> Product -> .category -> Category { name: "Electronics" }
 ```
 
-これは以下のSQLと等価:
-```sql
-SELECT orders.id, users.name, addresses.city
-FROM orders
-JOIN users ON orders.user_id = users.id
-JOIN addresses ON users.address_id = addresses.id
-WHERE addresses.country = 'Japan'
-```
+### 3.2 探索演算子の種類
 
-### 4.5 オプショナルリレーション（LEFT JOIN相当）
+```
+演算子    意味                            SQLの相当
+──────────────────────────────────────────────────────────
+->        リレーションを辿る（必須）      INNER JOIN
+-?>       リレーションを辿る（任意）      LEFT JOIN
+<-        逆方向に辿る                    逆JOIN
+<->       双方向                          FULL OUTER JOIN
+~>        再帰探索                        WITH RECURSIVE
+```
 
 ```rel
-from orders -?> coupon
-|> select {
-     order_id:  .id,
-     -- coupon は Option<Coupon> 型
-     discount:  coupon?.discount_rate ?? 0.0
-   }
+-- 必須リレーション（対応する相手が必ずいる場合のみ）
+User -> .orders -> Order
+
+-- 任意リレーション（クーポンがないユーザーも含む）
+User -?> .coupon -> Coupon
+
+-- 自己参照（組織ツリー）
+Employee { id: $root_id } ~> .reports(depth: 1..10)
 ```
 
-**`-?>`** を使うと、リレーション先が存在しない場合は `None` になる（LEFT JOIN相当）。
+### 3.3 リレーション上の制約
 
-### 4.6 複数リレーション（多対多）
+矢印の後にも`{}`で制約を追加できる。
 
 ```rel
--- ユーザーの全タグを取得（多対多）
-from users -> tags   -- many-to-many (中間テーブル自動解決)
-|> group by users.id, users.name
-|> select {
-     .id,
-     .name,
-     tags: collect(tags.name)
-   }
+-- 「完了済みの注文」のみを辿る
+User -> .orders { status: Delivered, created_at > 2026-01-01 } -> Order
+
+-- 「高評価レビュー」のみ
+Product -> .reviews { rating >= 4 } -> Review
 ```
 
-### 4.7 グラフ探索（再帰的リレーション）
+### 3.4 ネームバインディング（同じ型が複数現れる場合）
 
 ```rel
--- 組織階層の再帰探索
-from employees ~> reports_to(depth: 1..10)
-|> where .department == "Engineering"
-|> select { .id, .name, .level }
+-- フォロワーとフォロイー（どちらもUser型）
+u: User { id: $user_id } -> .following -> v: User
+=> { from: u.name, to: v.name }
+
+-- 「作成者」と「承認者」が同じUser型
+o: Order -> .creator -> creator: User
+         -?> .approver -> approver: User?
+=> { o.id, creator.name, approver: approver?.name ?? "未承認" }
+```
+
+### 3.5 多対多リレーション
+
+```rel
+-- 中間テーブルを意識せず書ける
+Product -> .tags -> Tag { name: "sale" }
+
+-- 特定タグを持つ商品と、そのタグ一覧
+User -> .tags -> Tag
+=> per(user) { user.name, tags: collect(tag.name) }
 ```
 
 ---
 
-## 5. GROUP BY / 集計
+## 4. 形状の抽出
 
-### 5.1 SQLとの比較
+### 4.1 `=>` 演算子
 
-**SQL:**
+SQLの`SELECT`に相当するが、パイプラインの**最後に一度だけ書く**。
+処理フローの一部ではなく、「欲しい形状の宣言」である。
+
+```rel
+-- フィールドを列挙
+User { age > 18 }
+=> { .id, .name, .email }
+
+-- 名前を変えて抽出
+User { age > 18 }
+=> { id: .id, full_name: .name, contact: .email }
+
+-- 計算フィールド
+User
+=> { .name, label: .name ++ " (" ++ .country ++ ")" }
+
+-- リレーション先を含む形状（ネスト）
+User { country: "Japan" } -> .orders -> Order
+=> {
+  user_name:  user.name,
+  order_id:   order.id,
+  amount:     order.amount,
+  product_names: order.items.product.name  -- ドットで深く辿れる
+}
+```
+
+### 4.2 ネストした形状
+
+```rel
+-- ユーザーの注文一覧を、ネスト構造で取得
+User { country: "Japan" }
+=> {
+  .id,
+  .name,
+  orders: .orders => [{
+    .id,
+    .amount,
+    .status,
+    items: .items => [{ product: .product.name, .qty }]
+  }]
+}
+```
+
+結果イメージ:
+```json
+{
+  "id": "...",
+  "name": "田中",
+  "orders": [
+    {
+      "id": "...",
+      "amount": 5000,
+      "status": "Delivered",
+      "items": [
+        { "product": "スマートフォン", "qty": 1 }
+      ]
+    }
+  ]
+}
+```
+
+### 4.3 条件つき抽出
+
+```rel
+User
+=> {
+  .name,
+  tier: .age >= 65 ? "senior" : .age >= 18 ? "adult" : "minor",
+  phone_masked: .phone?.take(4) ++ "****"
+}
+```
+
+### 4.4 全フィールドの抽出
+
+```rel
+-- 全フィールド
+User { age > 18 } => .
+
+-- 全フィールド + 追加
+User { age > 18 } => { ., rank: row_number() }
+```
+
+---
+
+## 5. 集計
+
+### 5.1 `per()` — GROUP BY の再発明
+
+SQLの`GROUP BY`は「どのフィールドでグループ化するか」を宣言する。
+Relの`per()`は「どのエンティティ単位で集計するか」を宣言する。
+
 ```sql
-SELECT country, COUNT(*)
-FROM users
-GROUP BY country
+-- SQL
+SELECT country, COUNT(*) FROM users GROUP BY country
 ```
 
-**Rel:**
 ```rel
-from users
-|> group by .country
-|> select {
-     country: .country,
-     count:   count()
-   }
+-- Rel: "ユーザーを国ごとに集計する"
+User
+=> per(.country) {
+  country: .country,
+  count:   count()
+}
 ```
 
-### 5.2 集計関数一覧
+### 5.2 エンティティ単位の集計
 
 ```rel
--- 標準集計関数
-count()              -- 行数
-count(.field)        -- NULL除外カウント
-count(distinct .field) -- 重複除外カウント
-sum(.field)          -- 合計
-avg(.field)          -- 平均
-min(.field)          -- 最小値
-max(.field)          -- 最大値
-stddev(.field)       -- 標準偏差
-variance(.field)     -- 分散
-median(.field)       -- 中央値
+-- SQL: SELECT u.id, u.name, COUNT(o.id), SUM(o.amount)
+--      FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.id, u.name
+
+-- Rel: "ユーザーごとに注文を集計する"
+User { country: "Japan" } -> .orders -> Order
+=> per(user) {
+  user.name,
+  order_count:   count(order),
+  total_revenue: sum(order.amount),
+  avg_order:     avg(order.amount),
+  last_order:    max(order.created_at)
+}
+```
+
+### 5.3 複数レベルの集計
+
+```rel
+-- ユーザーごと・ステータスごとの集計
+User -> .orders -> Order
+=> per(user, order.status) {
+  user.name,
+  status:  order.status,
+  count:   count(order),
+  revenue: sum(order.amount)
+}
+```
+
+### 5.4 HAVING 相当（集計後フィルタ）
+
+```rel
+-- 売上1万円以上のユーザーのみ
+User -> .orders -> Order
+=> per(user) {
+  user.name,
+  total: sum(order.amount)
+} where total > 10000
+```
+
+### 5.5 集計関数一覧
+
+```rel
+count()            -- 件数
+count(entity)      -- nullでない件数
+count(distinct .f) -- 重複除外件数
+sum(.field)
+avg(.field)
+min(.field)
+max(.field)
+median(.field)
+stddev(.field)
+variance(.field)
 
 -- コレクション系
-collect(.field)              -- リストに収集
-collect(distinct .field)     -- 重複除外リスト
-first(.field)                -- 最初の値
-last(.field)                 -- 最後の値
+collect(.field)           -- リストに収集
+collect(distinct .field)  -- 重複除外リスト
+first(.field)
+last(.field)
+any(.condition)           -- 1件でも条件を満たすか
+all(.condition)           -- 全件条件を満たすか
 ```
 
-### 5.3 複合集計
+### 5.6 ウィンドウ集計
 
 ```rel
-from orders
-|> group by .status, .country
-|> select {
-     status:        .status,
-     country:       .country,
-     total_orders:  count(),
-     total_revenue: sum(.amount),
-     avg_order:     avg(.amount),
-     max_order:     max(.amount)
-   }
-|> order by total_revenue desc
-```
-
-### 5.4 HAVING相当（集計後フィルタ）
-
-```rel
-from users
-|> group by .country
-|> having count() > 100          -- 集計後フィルタ
-|> select {
-     country: .country,
-     count:   count()
-   }
-```
-
-### 5.5 ウィンドウ関数
-
-```rel
-from orders
-|> window {
-     rank:       rank() over (partition by .user_id order by .created_at desc),
-     running_sum: sum(.amount) over (partition by .user_id order by .created_at)
-   }
-|> where .rank <= 3        -- 各ユーザーの直近3件
-|> select { .id, .user_id, .amount, .rank, .running_sum }
+-- 注文をユーザーごとにランキング（直近順）
+User -> .orders -> Order
+=> {
+  user.name,
+  order.amount,
+  order.created_at,
+  rank: rank() over user by order.created_at desc,
+  running_total: sum(order.amount) over user by order.created_at
+}
 ```
 
 ---
 
-## 6. ORDER / LIMIT / PAGINATION
+## 6. ソートとページング
 
-### 6.1 ソート構文
+### 6.1 ソート
 
 ```rel
-from products
-|> order by .price desc, .name asc
-|> select { .name, .price }
-```
+-- sort はパターンの後、=> の前または後に書ける
+User { age > 18 }
+sort (.name asc)
+=> { .name, .age }
 
-複数条件:
-```rel
-|> order by (.category asc, .price desc, .name asc)
+-- 複数条件
+User
+sort (.country asc, .age desc)
+=> { .name, .country, .age }
+
+-- 集計後のソート
+User -> .orders -> Order
+=> per(user) { user.name, total: sum(order.amount) }
+sort (total desc)
 ```
 
 ### 6.2 ページング
 
 ```rel
--- 最初の20件
-from users
-|> order by .created_at desc
-|> take 20
+-- オフセットベース
+User { age > 18 }
+sort (.created_at desc)
+take 20, skip 40
 
--- オフセットベース (21〜40件目)
-from users
-|> order by .created_at desc
-|> take 20 skip 20
-
--- カーソルベース（推奨：分散環境）
-from users
-|> order by .created_at desc
-|> after cursor:"eyJpZCI6MTAwfQ=="
-|> take 20
+-- カーソルベース（分散環境推奨）
+User
+sort (.created_at desc, .id desc)
+after "eyJpZCI6MTAwfQ=="
+take 20
 ```
 
-### 6.3 カーソルページング詳細
+### 6.3 1件取得
 
 ```rel
--- カーソルページングクエリ（分散環境推奨）
-from orders
-|> where .status == "active"
-|> order by .created_at desc, .id desc
-|> cursor_paginate {
-     after:    $cursor,     -- 入力パラメータ
-     per_page: 50
-   }
-|> select {
-     edges: {
-       node: { .id, .created_at, .amount },
-       cursor: encode_cursor(.created_at, .id)
-     },
-     page_info: {
-       has_next_page,
-       end_cursor
-     }
-   }
+-- 1件のみ（0件や複数件はエラー）
+User { id: $id } one
+
+-- 最初の1件（なければ None）
+User { email: $email } first
 ```
 
 ---
 
 ## 7. スキーマ定義
 
-### 7.1 基本テーブル定義
+SQLの`CREATE TABLE`に相当するが、「テーブル」ではなく「エンティティ」を定義する。
+エンティティには型・制約・デフォルト値をすべて宣言できる。
 
-**SQL:**
-```sql
-CREATE TABLE users (
-  id   UUID,
-  name TEXT,
-  age  INT
-)
-```
+### 7.1 エンティティ定義
 
-**Rel:**
 ```rel
 entity User {
-  id:         UUID          @primary @default(gen_uuid())
-  name:       String(255)   @required
-  age:        Int           @check(age >= 0 and age <= 150)
-  email:      String        @unique @index
-  created_at: Timestamp     @default(now())
-  updated_at: Timestamp     @auto_update(now())
+  id:            UUID           = gen_uuid_v7()
+  email:         Email          unique indexed
+  name:          String(200)    required
+  display_name:  String(100)?
+  age:           Int?           check(. >= 0 and . <= 150)
+  status:        UserStatus     = Active
+  country:       String?
+  plan:          Plan           = Free
+  metadata:      Json           = {}
+  created_at:    Timestamp      = now()
+  updated_at:    Timestamp      = now()  auto_update
+  deleted_at:    Timestamp?     indexed
+
+  index [country, status]
+  index [created_at desc]
+  check(name != "")
 }
 ```
 
-### 7.2 スキーマ定義の詳細
+### 7.2 フィールド修飾子一覧
+
+```
+修飾子              意味
+──────────────────────────────────────────────────────────
+= <expr>           デフォルト値
+required           NOT NULL（デフォルトはnullable）
+unique             ユニーク制約
+indexed            単一インデックス
+check(expr)        チェック制約（. は自フィールドの値）
+auto_update        更新時に自動でデフォルト式を再評価
+immutable          作成後変更不可
+encrypted          保存時に暗号化
+deprecated         非推奨（警告が出る）
+computed(expr)     計算フィールド（ストアしない）
+```
+
+### 7.3 カスタム型の定義
 
 ```rel
-entity Product {
-  -- 基本フィールド
-  id:           UUID          @primary @default(gen_uuid())
-  name:         String(500)   @required
-  description:  String?       -- オプショナル（nullable）
-  price:        Decimal(10,2) @check(price > 0)
-  stock:        Int           @default(0) @check(stock >= 0)
-  tags:         List<String>  @default([])
-  metadata:     Json          @default({})
+-- 型エイリアス（バリデーション付き）
+type Email    = String  check(is_email(.))
+type Url      = String  check(is_url(.))
+type Price    = Decimal(10,2) check(. >= 0)
+type Quantity = Int check(. >= 0)
 
-  -- 時系列フィールド
-  created_at:   Timestamp     @default(now())
-  updated_at:   Timestamp     @auto_update(now())
-  deleted_at:   Timestamp?    @index  -- ソフトデリート用
+-- 構造型
+type Address = {
+  street:  String,
+  city:    String,
+  country: String,
+  zip:     String?
+}
 
-  -- インデックス定義
-  @index([name, price])
-  @index([created_at desc])
-
-  -- テーブルレベル制約
-  @check(stock >= 0 or deleted_at != None)
+-- Enum
+enum UserStatus { Active, Inactive, Suspended, Deleted }
+enum Plan       { Free, Standard, Premium, Enterprise }
+enum OrderStatus {
+  Draft, Pending, Processing,
+  Shipped { tracking: String, carrier: String },
+  Delivered { at: Timestamp },
+  Cancelled { reason: String }
 }
 ```
 
-### 7.3 アノテーション一覧
-
-```
-アノテーション              意味
-─────────────────────────────────────────────────────────────
-@primary                   主キー
-@default(expr)             デフォルト値
-@auto_update(expr)         更新時に自動設定
-@required                  NOT NULL
-@unique                    ユニーク制約
-@index                     インデックス作成
-@index([fields])           複合インデックス
-@check(expr)               チェック制約
-@foreign(Entity.field)     外部キー（通常はrelationで定義）
-@deprecated                非推奨フィールドマーク
-@computed(expr)            計算フィールド（ストアしない）
-@encrypted                 保存時に暗号化
-@immutable                 作成後変更不可
-```
-
-### 7.4 スキーマのマイグレーション
+### 7.4 エンティティの継承
 
 ```rel
--- マイグレーション定義
-migration add_user_phone_v2 {
-  version: "2026-03-06-001"
-  description: "Add phone field to users"
+-- 基底エンティティ
+entity Timestamped {
+  created_at: Timestamp = now()
+  updated_at: Timestamp = now() auto_update
+  deleted_at: Timestamp?
+}
 
+-- 継承
+entity User extends Timestamped {
+  id:    UUID   = gen_uuid_v7()
+  email: Email  unique
+  name:  String required
+}
+```
+
+### 7.5 マイグレーション
+
+```rel
+migration "2026-03-06/001-initial" {
   up {
-    alter User {
-      add phone: String?
-      add phone_verified: Bool @default(false)
-    }
-    add_index User.phone
+    create User, Order, OrderItem, Product, Category, Tag
   }
-
   down {
-    alter User {
-      drop phone
-      drop phone_verified
-    }
+    drop Tag, Category, Product, OrderItem, Order, User
   }
+}
+
+migration "2026-03-06/002-add-phone" {
+  up   { User += { phone: String? } }
+  down { User -= phone }
 }
 ```
 
@@ -568,80 +584,67 @@ migration add_user_phone_v2 {
 
 ## 8. リレーション定義
 
-### 8.1 基本的なリレーション定義
+リレーションはスキーマの一部として宣言する。
+クエリ時にJOINキーを書かなくてよいのはこのためである。
+
+### 8.1 基本的なリレーション
 
 ```rel
--- 1対多: User has many Orders
-relation User.orders -> Order[] via Order.user_id
+-- 1対多: User は複数の Order を持つ
+User -> orders -> Order[*] via order.user_id
 
--- 多対1: Order belongs to User
-relation Order.user -> User via Order.user_id
+-- 多対1: Order は1人の User に属する
+Order -> user -> User via order.user_id
 
--- 1対1: User has one Profile
-relation User.profile -> Profile? via Profile.user_id
+-- 1対1: User は1つの Profile を持つ（任意）
+User -> profile -> Profile? via profile.user_id
 ```
 
-### 8.2 多対多リレーション
+### 8.2 多対多
 
 ```rel
--- 中間テーブルを明示
-relation User.tags <-> Tag[] via UserTag {
-  user_id: UUID -> User.id
-  tag_id:  UUID -> Tag.id
+-- 中間テーブルを自動管理
+User -> tags <-> Tag[*] via UserTag {
+  user_id: -> User.id
+  tag_id:  -> Tag.id
 }
 ```
 
-### 8.3 自己参照リレーション
+### 8.3 自己参照
 
 ```rel
 entity Employee {
-  id:         UUID    @primary
+  id:         UUID
   name:       String
-  manager_id: UUID?   -- 自己参照
+  manager_id: UUID?
 }
 
--- 自己参照リレーション
-relation Employee.manager   -> Employee? via Employee.manager_id
-relation Employee.reports   -> Employee[] via Employee.manager_id
+Employee -> manager  -> Employee?   via employee.manager_id
+Employee -> reports  -> Employee[*] via employee.manager_id
+Employee -> ancestors -> Employee[*] recursive via employee.manager_id
 ```
 
-### 8.4 多態的リレーション（Polymorphic）
+### 8.4 条件付きリレーション
 
 ```rel
--- コメントは複数のエンティティにつけられる
+-- アクティブな注文のみ
+User -> active_orders -> Order[*]
+  via order.user_id
+  where order.status in [Pending, Processing, Shipped]
+  sort order.created_at desc
+```
+
+### 8.5 ポリモーフィックリレーション
+
+```rel
 entity Comment {
-  id:           UUID    @primary
-  body:         String
-  target_type:  String  -- "Post" | "Product" | "User"
-  target_id:    UUID
+  id:          UUID
+  body:        String
+  target_type: String
+  target_id:   UUID
 }
 
-relation Comment.target -> Post | Product | User via (target_type, target_id)
-```
-
-### 8.5 カスタムリレーション（条件付き）
-
-```rel
--- アクティブな注文のみのリレーション
-relation User.active_orders -> Order[]
-  via Order.user_id
-  where Order.status in ["pending", "processing"]
-  order by Order.created_at desc
-```
-
-### 8.6 グラフリレーション（再帰）
-
-```rel
-entity Category {
-  id:        UUID   @primary
-  name:      String
-  parent_id: UUID?
-}
-
--- 再帰的リレーション（ツリー構造）
-relation Category.parent    -> Category?   via Category.parent_id
-relation Category.children  -> Category[]  via Category.parent_id
-relation Category.ancestors -> Category[]  recursive via Category.parent_id
+Comment -> target -> Post | Product | User via (target_type, target_id)
 ```
 
 ---
@@ -650,1100 +653,706 @@ relation Category.ancestors -> Category[]  recursive via Category.parent_id
 
 ### 9.1 プリミティブ型
 
-```rel
--- 数値型
-Int          -- 64bit 整数 (-9,223,372,036,854,775,808 ~ 9,223,372,036,854,775,807)
-Int8         -- 8bit 整数
-Int16        -- 16bit 整数
-Int32        -- 32bit 整数
-Int64        -- 64bit 整数 (Intと同じ)
-UInt         -- 符号なし64bit整数
-Float        -- 64bit 浮動小数点 (IEEE 754 double)
-Float32      -- 32bit 浮動小数点
-Decimal(p,s) -- 固定精度小数 (金融計算向け)
-
--- 文字列型
-String       -- 可変長UTF-8文字列
-String(n)    -- 最大n文字のUTF-8文字列
-Char(n)      -- 固定長n文字
-Text         -- 無制限テキスト
-
--- 真偽値型
-Bool         -- true | false
-
--- 時間型
-Date         -- 日付 (YYYY-MM-DD)
-Time         -- 時刻 (HH:MM:SS.mmm)
-Timestamp    -- 日時 (UTC)
-TimestampTZ  -- タイムゾーン付き日時
-Duration     -- 時間間隔
-Interval     -- 期間
-
--- バイナリ型
-Bytes        -- 可変長バイナリ
-Bytes(n)     -- 固定長バイナリ
-
--- 識別子型
-UUID         -- UUID v4/v7
-ULID         -- ソート可能な一意ID
-Snowflake    -- 分散環境向けID
-
--- ネットワーク型
-IpAddr       -- IPv4 / IPv6 (自動判定)
-MacAddr      -- MACアドレス
-Url          -- バリデート済みURL
-Email        -- バリデート済みメールアドレス
-
--- 地理型
-Point        -- 地理座標 (lat, lon)
-Polygon      -- 多角形
-GeoHash      -- GeoHash文字列
+```
+数値:     Int, Int8, Int16, Int32, Int64, UInt, Float, Float32, Decimal(p,s)
+文字列:   String, String(n), Text
+真偽値:   Bool
+時間:     Date, Time, Timestamp, TimestampTZ, Duration
+バイナリ: Bytes
+識別子:   UUID, ULID, Snowflake
+ネット:   IpAddr, Url, Email
+地理:     Point, Polygon, GeoHash
 ```
 
 ### 9.2 コンテナ型
 
 ```rel
--- リスト型（順序あり、重複可）
-List<T>           -- 例: List<String>, List<Int>
-
--- セット型（順序なし、重複不可）
-Set<T>            -- 例: Set<UUID>
-
--- マップ型（キーバリュー）
-Map<K, V>         -- 例: Map<String, Int>
-
--- タプル型（異種複数値）
-(T1, T2, T3)      -- 例: (String, Int, Bool)
-
--- JSON型
-Json              -- 任意のJSON値
-Json<T>           -- 型付きJSON（スキーマ検証あり）
+String?          -- Option<String>: Some(value) | None
+List<T>          -- 順序あり、重複可
+Set<T>           -- 順序なし、重複不可
+Map<K, V>        -- キーバリュー
+(T1, T2, T3)     -- タプル
+Stream<T>        -- 無限シーケンス（ストリーム処理用）
 ```
 
-### 9.3 Option型（Nullableの再設計）
+### 9.3 Option型（NULLの廃止）
+
+```
+SQLのNULL    三値論理。NULL == NULL → NULL（!）
+RelのNone    Option型。None == None → false（直感的）
+```
 
 ```rel
--- SQLのNULLは廃止。代わりにOption型を使用
-String?   -- Option<String> の省略記法 = Some(value) | None
+-- Option の操作
+user.phone ?? "N/A"              -- None ならデフォルト値
+user.phone?.to_upper()           -- None なら None のまま
+user.phone!                      -- 強制アンラップ（Noneならパニック）
 
--- Optionの操作
-user.email ?? "no-email"           -- デフォルト値
-user.email?.to_upper()             -- optional chaining
-user.email.unwrap()                -- 値を取り出す（Noneならエラー）
-user.email.expect("email required") -- カスタムエラーメッセージ付きunwrap
-
--- パターンマッチング
-match user.phone {
+-- パターンマッチ
+user.phone match {
   Some(p) => send_sms(p),
   None    => send_email(user.email)
 }
 ```
 
-### 9.4 カスタム型
+### 9.4 代数的データ型
 
 ```rel
--- 型エイリアス
-type UserId   = UUID
-type Email    = String  @validate(is_email)
-type Price    = Decimal(10,2) @check(value > 0)
-type Quantity = Int @check(value >= 0)
-
--- 構造体型
-type Address = {
-  street:   String,
-  city:     String,
-  country:  CountryCode,
-  zip:      String?
+-- Enumのバリアントがデータを持てる
+enum OrderStatus {
+  Pending
+  Processing { started_at: Timestamp }
+  Shipped    { tracking: String, carrier: String }
+  Delivered  { at: Timestamp }
+  Cancelled  { reason: String, refund: Price? }
 }
 
--- ユニオン型
-type PaymentMethod = "credit_card" | "bank_transfer" | "crypto"
-
--- 代数的データ型
-type OrderStatus =
-  | Pending
-  | Processing { started_at: Timestamp }
-  | Shipped    { tracking_id: String, carrier: String }
-  | Delivered  { delivered_at: Timestamp }
-  | Cancelled  { reason: String, refund_amount: Decimal? }
+-- パターンマッチ
+order.status match {
+  Pending             => "受付中",
+  Processing { started_at } => "処理中: " ++ started_at,
+  Shipped { tracking, carrier } => carrier ++ "/" ++ tracking,
+  Delivered { at }    => "配達済: " ++ at,
+  Cancelled { reason } => "ＣＡ: " ++ reason
+}
 ```
 
-### 9.5 Enum型
+### 9.5 型推論
 
 ```rel
-enum Status {
-  Active   = "active"
-  Inactive = "inactive"
-  Pending  = "pending"
-  Deleted  = "deleted"
-}
+-- アノテーション不要
+let count   = User { age > 18 } count     -- Int
+let names   = User => .name               -- Stream<String>
+let revenue = Order sum(.amount)          -- Decimal
 
-enum Priority {
-  Low    = 1
-  Medium = 2
-  High   = 3
-  Critical = 4
-}
-
--- Enumの使用
-from tickets
-|> where .priority >= Priority.High
-|> select { .id, .title, .priority }
-```
-
-### 9.6 型推論
-
-```rel
--- 型アノテーションなしでも型は推論される
-let user_count = from users |> count()
--- user_count の型: Int （推論）
-
-let names = from users |> select .name
--- names の型: Stream<{ name: String }> （推論）
-
--- 型エラーの例（コンパイル時に検出）
-from users
-|> where .name > 100   -- ERROR: String > Int は不正
-|> select .name
-```
-
-### 9.7 型システム階層図
-
-```
-                    ┌──────────┐
-                    │   Any    │ (内部型、ユーザー使用不可)
-                    └────┬─────┘
-          ┌──────────────┼──────────────┐
-     ┌────┴───┐    ┌─────┴────┐   ┌────┴────┐
-     │Scalar  │    │Compound  │   │Special  │
-     └────┬───┘    └─────┬────┘   └────┬────┘
-          │              │              │
-    ┌─────┼─────┐   ┌────┼────┐   ┌────┼────┐
-  Numeric String Bool List Set Map Option Stream
-    │       │
-  Int    String(n)
-  Float  Text
-  Decimal Email
+-- 型エラーはコンパイル時に検出
+User { age > "adult" }
+-- Error[E001]: Type mismatch: age is Int, "adult" is String
 ```
 
 ---
 
-## 10. クエリの再利用
+## 10. 名前付きパターン（再利用）
 
-### 10.1 名前付きクエリ
+### 10.1 パターンの定義
+
+`def`でパターンに名前をつける。SQLのVIEWに相当するが、**合成可能**。
 
 ```rel
--- クエリを名前付きで定義
-query adult_users {
-  from users
-  |> where .age >= 18
-  |> where .status == Status.Active
-}
+-- 基本パターン
+def active_users = User { status: Active, deleted_at: None }
 
--- 再利用
-from adult_users
-|> order by .name
-|> select { .id, .name }
+-- 既存パターンを拡張して合成
+def adult_users   = active_users { age >= 18 }
+def premium_users = active_users { plan: Premium | plan: Enterprise }
+def japan_users   = active_users { country: "Japan" }
+
+-- 合成
+def japan_premium = japan_users { plan: Premium | plan: Enterprise }
 ```
 
-### 10.2 パラメータ付きクエリ
+### 10.2 パラメータ付きパターン
 
 ```rel
--- パラメータを持つクエリ
-query users_by_country(country: String) {
-  from users
-  |> where .country == country
-  |> order by .name
+-- 引数を取るパターン
+def users_in(country: String) = active_users { country }
+
+def orders_since(days: Int) = Order {
+  created_at > now() - days.d,
+  status: Delivered
 }
 
-query users_by_age_range(min_age: Int, max_age: Int) {
-  from users
-  |> where .age >= min_age and .age <= max_age
-}
-
--- 使用例
-from users_by_country("Japan")
-|> select { .name, .email }
-
-from users_by_age_range(20, 30)
-|> select { .name, .age }
-```
-
-### 10.3 クエリの合成
-
-```rel
--- 基底クエリ
-query active_users {
-  from users
-  |> where .status == Status.Active
-}
-
--- 合成クエリ（active_usersを拡張）
-query premium_users {
-  from active_users              -- 既存クエリを参照
-  |> where .plan == "premium"
-}
-
-query premium_users_japan {
-  from premium_users             -- さらに合成
-  |> where .country == "Japan"
-}
-```
-
-### 10.4 クエリとしての関数
-
-```rel
--- 高階クエリ（クエリを引数に取る）
-query with_pagination(base: Query<T>, page: Int, per_page: Int) -> Query<T> {
-  from base
-  |> order by .id
-  |> take per_page skip (page * per_page)
-}
+def top_products(n: Int, category: String?) =
+  Product { category: category ?? any, stock > 0, is_active: true }
+  sort (.sold_count desc)
+  take n
 
 -- 使用
-from with_pagination(adult_users, page: 0, per_page: 20)
-|> select { .id, .name }
+users_in("Japan") -> .orders -> orders_since(30)
+=> per(user) { user.name, revenue: sum(order.amount) }
 ```
 
-### 10.5 クエリのマテリアライズ
+### 10.3 パターンの合成（高階）
 
 ```rel
--- 事前計算してキャッシュするマテリアライズドクエリ
-@materialized(refresh: every 1h)
-query daily_revenue_stats {
-  from orders
-  |> where .created_at >= today() - 30.days
-  |> group by date(.created_at), .country
-  |> select {
-       date:    date(.created_at),
-       country: .country,
-       revenue: sum(.amount),
-       orders:  count()
-     }
-}
+-- クエリを引数に取る
+def with_pagination(pattern: Pattern, page: Int, per: Int) =
+  pattern skip (page * per) take per
+
+def with_soft_delete(pattern: Pattern) =
+  pattern { deleted_at: None }
+
+-- 使用
+with_pagination(adult_users, page: 2, per: 50)
+=> { .id, .name }
+```
+
+### 10.4 マテリアライズドパターン
+
+```rel
+-- 定期的に事前計算してキャッシュ
+@materialized(refresh: 1h)
+def daily_revenue =
+  Order { status: Delivered }
+  => per(.created_at.date) {
+    date:    .created_at.date,
+    revenue: sum(.amount),
+    orders:  count()
+  }
 ```
 
 ---
 
-## 11. モジュールシステム
+## 11. モジュール
 
 ### 11.1 モジュール定義
 
 ```rel
--- analytics.relmod
 module analytics {
+  import ecommerce.*
+  import std.time.*
 
-  -- モジュールレベルのインポート
-  import core.types { UUID, Timestamp, Decimal }
-  import entities   { User, Order, Product }
+  export def active_users = User { status: Active }
 
-  -- モジュール内クエリ
-  export query revenue_by_country {
-    from orders
-    |> group by .country
-    |> select {
-         country: .country,
-         revenue: sum(.amount)
-       }
-    |> order by revenue desc
-  }
+  export def revenue_by_country =
+    Order { status: Delivered }
+    -> .user -> User
+    => per(user.country) {
+      country: user.country,
+      revenue: sum(order.amount),
+      orders:  count(order)
+    }
+    sort (revenue desc)
 
-  export query top_customers(limit: Int = 10) {
-    from users -> orders
-    |> group by users.id, users.name
-    |> select {
-         id:            users.id,
-         name:          users.name,
-         total_spent:   sum(orders.amount),
-         order_count:   count(orders.id)
-       }
-    |> order by total_spent desc
-    |> take limit
-  }
+  export def top_customers(limit: Int = 10) =
+    User -> .orders { status: Delivered } -> Order
+    => per(user) {
+      user.name,
+      total:  sum(order.amount),
+      count:  count(order)
+    }
+    sort (total desc)
+    take limit
 
-  -- モジュール内プライベートクエリ（export なし）
-  query _base_orders {
-    from orders
-    |> where .status != "cancelled"
-  }
-
+  -- プライベート（exportなし）
+  def _base = Order { status: Delivered }
 }
 ```
 
-### 11.2 モジュールのインポート
+### 11.2 インポートとネームスペース
 
 ```rel
--- 単一インポート
 import analytics.revenue_by_country
-
--- 複数インポート
-import analytics { revenue_by_country, top_customers }
-
--- 名前空間付きインポート
+import analytics { top_customers, active_users }
 import analytics as an
 
--- 全インポート
-import analytics.*
-
--- 使用例
-from an.revenue_by_country
-|> take 5
-```
-
-### 11.3 名前空間
-
-```rel
-namespace ecommerce {
-
-  namespace analytics {
-    export query ...
-  }
-
-  namespace inventory {
-    export query ...
-  }
-
-}
-
 -- 使用
-import ecommerce.analytics.*
-```
-
-### 11.4 モジュールの依存関係管理
-
-```rel
--- rel.lock (依存定義ファイル)
-module_config {
-  name:    "my_analytics"
-  version: "1.0.0"
-
-  dependencies {
-    rel_stdlib: ">=0.1.0"
-    rel_geo:    "~0.3.0"   -- 地理演算モジュール
-    rel_ml:     "^0.2.0"   -- ML拡張モジュール
-  }
-}
-```
-
-### 11.5 標準ライブラリモジュール
-
-```rel
--- 標準モジュール一覧
-import std.math      { abs, ceil, floor, round, sqrt, pow }
-import std.string    { upper, lower, trim, pad, split, regex }
-import std.datetime  { now, today, parse_date, format_date }
-import std.crypto    { hash_sha256, hmac, uuid_v7 }
-import std.geo       { distance, within_radius, st_contains }
-import std.json      { parse, stringify, path, merge }
-import std.array     { map, filter, reduce, zip, flatten }
-import std.stats     { percentile, correlation, regression }
+an.top_customers(limit: 20) => { .name, .total }
 ```
 
 ---
 
-## 12. 実行モデル
+## 12. 書き込み操作
 
-### 12.1 コンパイルパイプライン概要
+### 12.1 作成（INSERT）
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   Rel Compilation Pipeline                  │
-│                                                             │
-│  .rel source                                                │
-│       │                                                     │
-│       ▼                                                     │
-│  ┌──────────┐   Tokenize / Lex                              │
-│  │  Lexer   │   → Token Stream                              │
-│  └────┬─────┘                                               │
-│       │                                                     │
-│       ▼                                                     │
-│  ┌──────────┐   Parse Token Stream                          │
-│  │  Parser  │   → AST (Abstract Syntax Tree)                │
-│  └────┬─────┘                                               │
-│       │                                                     │
-│       ▼                                                     │
-│  ┌────────────┐  Resolve Names / Check Types                │
-│  │  Analyzer  │  → Typed AST                                │
-│  └─────┬──────┘                                             │
-│        │                                                    │
-│        ▼                                                    │
-│  ┌───────────────┐  Lower to Logical Plan                   │
-│  │ IR Generator  │  → Logical Query IR                      │
-│  └──────┬────────┘                                          │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌───────────────┐  Cost-based Optimization                 │
-│  │    Planner    │  → Optimized Logical Plan                 │
-│  └──────┬────────┘                                          │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌───────────────┐  Generate Physical Execution Steps       │
-│  │ Exec Planner  │  → Physical Execution Plan               │
-│  └──────┬────────┘                                          │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌───────────────┐  Distributed Planning                    │
-│  │ Dist Planner  │  → Distributed Execution Plan            │
-│  └──────┬────────┘                                          │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌───────────────┐  Execute on Nodes                        │
-│  │   Executor    │  → Result Stream                         │
-│  └───────────────┘                                          │
-└─────────────────────────────────────────────────────────────┘
+```rel
+-- エンティティを作成
+create User {
+  email: "alice@example.com",
+  name:  "Alice",
+  age:   25
+}
+-- → User型を返す
+
+-- 複数作成
+create User[*] [
+  { email: "alice@example.com", name: "Alice" },
+  { email: "bob@example.com",   name: "Bob"   }
+]
 ```
 
-### 12.2 AST構造
+### 12.2 更新（UPDATE）
 
-```
-クエリ: from users |> where .age > 18 |> select .name
+```rel
+-- エンティティパターンにマッチするものを更新
+User { id: $id } update {
+  name:       "New Name",
+  updated_at: now()
+}
 
-AST:
-Pipeline
-├── Source
-│   └── TableRef("users")
-├── Operator: Where
-│   └── BinaryExpr
-│       ├── FieldAccess("age")
-│       ├── Op: GreaterThan
-│       └── Literal(Int, 18)
-└── Operator: Select
-    └── FieldAccess("name")
+-- リレーション先も含めた更新
+User { country: "Japan" } update { tax_rate: 0.1 }
 ```
 
-### 12.3 論理クエリプランの例
+### 12.3 削除（DELETE）
 
-```
-クエリ: from orders -> user |> where user.country == "JP" |> select { orders.id, user.name }
+```rel
+-- 物理削除
+User { status: Deleted, deleted_at < now() - 90d } delete
 
-論理プラン (s式表記):
-(Project
-  [orders.id, user.name]
-  (Filter
-    (= user.country "JP")
-    (HashJoin
-      (inner)
-      (Scan orders)
-      (Scan users)
-      (= orders.user_id users.id))))
+-- ソフトデリート（updateで表現）
+User { id: $id } update { deleted_at: now(), status: Deleted }
 ```
 
-### 12.4 オプティマイザの最適化規則
+### 12.4 UPSERT
 
-```
-最適化規則の例:
-
-1. Predicate Pushdown（述語プッシュダウン）
-   BEFORE: Filter(Scan(T)) → Join → Filter(...)
-   AFTER:  Join(Filter(Scan(T)), Filter(Scan(U)))
-   効果: JOINする前に行を減らす
-
-2. Column Pruning（カラム剪定）
-   BEFORE: Project[name](Scan[id,name,age,email](users))
-   AFTER:  Project[name](Scan[name](users))
-   効果: 不要なカラムを読まない
-
-3. Join Reordering（JOIN順序最適化）
-   コストモデルに基づいて最小コストのJOIN順を選択
-
-4. Index Utilization（インデックス利用）
-   WHERE句の条件に対応するインデックスを自動選択
-
-5. Materialized Query Reuse（マテリアライズドクエリ再利用）
-   既存のマテリアライズドビューを自動的に再利用
-```
-
-### 12.5 物理実行プランの例
-
-```
-物理実行プラン:
-
-PhysicalPlan {
-  type: DistributedHashJoin,
-  build_side: {
-    type: IndexScan,
-    table: "users",
-    index: "idx_users_country",
-    predicate: country == "JP",
-    projection: [id, name]
-  },
-  probe_side: {
-    type: SequentialScan,
-    table: "orders",
-    projection: [id, user_id]
-  },
-  join_keys: [(orders.user_id, users.id)],
-  projection: [orders.id, users.name],
-  parallelism: 8
+```rel
+User { email: "alice@example.com" } upsert {
+  name:       "Alice Updated",
+  updated_at: now()
+} on_create {
+  -- 新規作成時のみ設定するフィールド
+  created_at: now()
 }
 ```
 
-### 12.6 実行エンジンのアーキテクチャ
-
-```
-┌──────────────────────────────────────────────────────┐
-│                  Execution Engine                    │
-│                                                      │
-│  ┌─────────────────────────────────────────────────┐ │
-│  │  Vectorized Execution Engine (SIMD対応)         │ │
-│  │                                                 │ │
-│  │  Batch[0..1023]  →  Batch[0..1023]  → ...      │ │
-│  │  （行単位ではなくバッチ単位で処理）              │ │
-│  └─────────────────────────────────────────────────┘ │
-│                                                      │
-│  ┌─────────────────────────────────────────────────┐ │
-│  │  Columnar Storage Interface                     │ │
-│  │  Apache Arrow互換バッファ                       │ │
-│  └─────────────────────────────────────────────────┘ │
-│                                                      │
-│  ┌─────────────────────────────────────────────────┐ │
-│  │  Async Streaming Execution                      │ │
-│  │  Backpressure対応                               │ │
-│  └─────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────┘
-```
-
----
-
-## 13. 分散クエリ
-
-### 13.1 設計原則
-
-```
-Relの分散処理は「透過的分散」を原則とする。
-
-開発者はシングルノードと同じ構文でクエリを書く。
-エンジンが自動的に分散実行プランを生成する。
-
-ただし、パフォーマンスチューニング時は
-明示的な分散制御も可能。
-```
-
-### 13.2 シャーディング定義
+### 12.5 トランザクション
 
 ```rel
--- エンティティのシャーディング設定
-entity Order {
-  id:         UUID      @primary
-  user_id:    UUID
-  amount:     Decimal
-  created_at: Timestamp
-}
-
--- シャーディングポリシー
-@shard(
-  strategy: hash,          -- hash | range | list
-  key:      .user_id,      -- シャードキー
-  count:    256,           -- シャード数
-  replicas: 3              -- レプリカ数
-)
-
--- 範囲シャーディング（時系列データに最適）
-@shard(
-  strategy: range,
-  key:      .created_at,
-  ranges: [
-    { to: "2024-01-01", node_group: "cold_storage" },
-    { to: "2025-01-01", node_group: "warm_storage" },
-    { from: "2025-01-01", node_group: "hot_storage" }
-  ]
-)
-```
-
-### 13.3 分散クエリの実行フロー
-
-```
-クエリ: from orders |> where .user_id == "abc" |> sum(.amount)
-
-分散実行フロー:
-
-┌─────────────────────────────────────────────────────────────┐
-│  Coordinator Node                                           │
-│                                                             │
-│  1. クエリ受信・解析                                        │
-│  2. シャードキー (.user_id == "abc") を検出                 │
-│  3. 対象シャード特定 → Shard #42 のみ                       │
-│  4. Shard #42 にクエリ送信                                  │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Shard #42                                          │   │
-│  │  1. ローカルストレージをスキャン                     │   │
-│  │  2. フィルタ適用                                    │   │
-│  │  3. 部分集計 (partial_sum = 12500.00)               │   │
-│  │  4. 結果をCoordinatorに返却                         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  5. 部分集計を最終集計 → 12500.00                           │
-│  6. クライアントに返却                                      │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 13.4 分散集計（Scatter-Gather）
-
-```
-クエリ: from orders |> group by .country |> sum(.amount)
-
-Scatter-Gather実行:
-
-Coordinator
-    │
-    ├──→ Shard #1  →  { JP: 5000, US: 3000 }
-    ├──→ Shard #2  →  { JP: 7000, UK: 2000 }
-    ├──→ Shard #3  →  { US: 4000, JP: 1000 }
-    └──→ Shard #N  →  { ... }
-
-Merge Phase (Coordinator):
-  JP: 5000 + 7000 + 1000 = 13000
-  US: 3000 + 4000         = 7000
-  UK: 2000                = 2000
-```
-
-### 13.5 ノード間通信プロトコル
-
-```
-┌───────────────────────────────────────────────────────────┐
-│  Rel Wire Protocol (RWP) v1                               │
-│                                                           │
-│  Transport:   gRPC / HTTP2                                │
-│  Encoding:    Protocol Buffers (binary)                   │
-│  Data Format: Apache Arrow IPC (columnar)                 │
-│  Compression: LZ4 / Zstd (自動選択)                      │
-│                                                           │
-│  Message Types:                                           │
-│  ┌──────────────────┬─────────────────────────────────┐  │
-│  │  QueryRequest    │ クエリの送信                     │  │
-│  │  PartialResult   │ 部分結果のストリーミング返却      │  │
-│  │  FinalResult     │ 完了通知 + 最終メタデータ        │  │
-│  │  CancelRequest   │ クエリのキャンセル               │  │
-│  │  HeartBeat       │ ノードの生存確認                 │  │
-│  └──────────────────┴─────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────┘
-```
-
-### 13.6 ストリーム処理
-
-```rel
--- リアルタイムストリーム処理
-stream order_events from kafka("orders-topic") {
-  format: json,
-  schema: {
-    order_id:   UUID,
-    user_id:    UUID,
-    amount:     Decimal,
-    event_type: "created" | "updated" | "cancelled",
-    ts:         Timestamp
-  }
-}
-
--- ストリームクエリ（タンブリングウィンドウ）
-from order_events
-|> where .event_type == "created"
-|> window tumbling(size: 1m)
-|> group by .country
-|> select {
-     window_start: window.start,
-     country:      .country,
-     order_count:  count(),
-     revenue:      sum(.amount)
-   }
-|> sink kafka("revenue-metrics-topic")
-
--- スライディングウィンドウ
-from order_events
-|> window sliding(size: 5m, step: 1m)
-|> group by .user_id
-|> having sum(.amount) > 10000      -- 5分間で1万以上
-|> select { .user_id, total: sum(.amount) }
-|> sink alert_service("high_value_users")
-```
-
-### 13.7 分散トランザクション
-
-```rel
--- 分散トランザクション（2フェーズコミット）
 transaction place_order {
-  isolation: serializable,     -- read_committed | repeatable_read | serializable
-  timeout:   30s,
+  isolation: Serializable
+  timeout:   30s
   retry:     3
 
-  steps {
-    -- ステップ1: 在庫確認・確保
-    let product = from products
-                  |> where .id == $product_id
-                  |> lock(for: update)   -- 悲観的ロック
-                  |> single!()           -- 1件のみ、なければエラー
+  let user = User { id: $user_id, status: Active } one
 
-    guard product.stock >= $quantity
-      else Error.InsufficientStock
+  let product = Product { id: $product_id } lock(write) one
+  guard product.stock >= $qty else InsufficientStock { available: product.stock }
 
-    update products
-    |> where .id == $product_id
-    |> set { stock: product.stock - $quantity }
+  product update { stock: product.stock - $qty }
 
-    -- ステップ2: 注文作成
-    let order_id = insert Order {
-      user_id:    $user_id,
-      product_id: $product_id,
-      quantity:   $quantity,
-      amount:     product.price * $quantity,
-      status:     OrderStatus.Pending
-    }
-
-    -- ステップ3: 支払処理（外部サービス呼び出し）
-    let payment = await payment_service.charge($user_id, order.amount)
-
-    -- ステップ4: 注文確定
-    update orders
-    |> where .id == order_id
-    |> set {
-         status:      OrderStatus.Processing,
-         payment_id:  payment.id
-       }
-
-    return { order_id, payment_id: payment.id }
+  let order = create Order {
+    user_id:      $user_id,
+    total_amount: product.price * $qty,
+    status:       Pending
   }
+
+  create OrderItem {
+    order_id:   order.id,
+    product_id: $product_id,
+    qty:        $qty,
+    unit_price: product.price
+  }
+
+  return { order.id, total: order.total_amount }
 }
 ```
 
 ---
 
-## 14. SQLとの比較
+## 13. 実行モデル
 
-### 14.1 機能比較表
+### 13.1 コンパイルパイプライン
 
-| 機能 | SQL | Rel |
-|------|-----|-----|
-| **構文の読み順** | SELECT→FROM→WHERE（実行順と逆） | FROM→WHERE→SELECT（実行順と一致） |
-| **JOIN記述** | `JOIN ... ON ...` を毎回記述 | `->` 演算子でリレーション探索 |
-| **NULL処理** | 三値論理 (T/F/NULL) | Option型 (Some/None) |
-| **型システム** | 弱い型・暗黙キャスト | 強い静的型・型推論 |
-| **サブクエリ** | ネスト地獄になりやすい | パイプラインで平坦に記述 |
-| **クエリ再利用** | VIEW / Stored Procedure | first-class `query` |
-| **モジュール** | スキーマ/DB単位のみ | module / namespace / import |
-| **型定義** | 限定的 | カスタム型・enum・代数的データ型 |
-| **分散処理** | 方言依存・手動設定 | ネイティブ組み込み・透過的 |
-| **ストリーム処理** | 非対応（拡張必要） | ネイティブサポート |
-| **型安全なJSON** | 限定的 | Json<T> で型付きJSON |
-| **再帰クエリ** | WITH RECURSIVE（複雑） | `~>` 演算子で直感的 |
-| **トランザクション** | BEGIN/COMMIT/ROLLBACK | transaction ブロック |
-| **マイグレーション** | ALTER TABLE（言語外） | migration ブロック（言語内） |
-| **コンパイル時エラー** | ほぼなし（実行時エラー） | 型エラー・リレーションエラーを事前検出 |
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Rel コンパイルパイプライン                    │
+│                                                                 │
+│  .rel ソース                                                    │
+│       │                                                         │
+│       ▼                                                         │
+│  [ Lexer ]  → Token列                                           │
+│       │                                                         │
+│       ▼                                                         │
+│  [ Parser ] → AST                                               │
+│               ├── EntityPattern                                 │
+│               ├── TraversalExpr                                 │
+│               ├── ExtractionExpr                                │
+│               └── AggregationExpr                               │
+│       │                                                         │
+│       ▼                                                         │
+│  [ Type Checker ]                                               │
+│    - エンティティの型解決                                       │
+│    - リレーションの検証                                         │
+│    - 抽出形状の型付け                                           │
+│    - 集計文脈のチェック                                         │
+│       │                                                         │
+│       ▼                                                         │
+│  [ Logical Plan ]  グラフ探索計画                               │
+│    EntityScan → TraversalJoin → Aggregate → Project             │
+│       │                                                         │
+│       ▼                                                         │
+│  [ Optimizer ]                                                  │
+│    - パターン条件のプッシュダウン                               │
+│    - インデックス選択                                           │
+│    - JOINの順序最適化                                           │
+│    - マテリアライズドパターンの置換                             │
+│       │                                                         │
+│       ▼                                                         │
+│  [ Physical Plan ]  実際の実行計画                              │
+│    IndexLookup / SeqScan / HashJoin / MergeJoin                 │
+│       │                                                         │
+│       ▼                                                         │
+│  [ Distributed Planner ]  シャード分割計画                      │
+│       │                                                         │
+│       ▼                                                         │
+│  [ Executor ]  並列実行 → 結果ストリーム                        │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-### 14.2 クエリ書き方の比較
+### 13.2 ASTの構造例
 
-#### シンプルなSELECT
+```
+クエリ: User { country: "Japan" } -> .orders -> Order { amount > 1000 }
+        => per(user) { user.name, total: sum(order.amount) }
+
+AST:
+Query
+├── Pattern: EntityPattern
+│   ├── entity: "User"
+│   ├── constraints: [Field("country") == Lit("Japan")]
+│   └── traversal:
+│       └── TraversalExpr
+│           ├── relation: ".orders"
+│           ├── target: EntityPattern
+│           │   ├── entity: "Order"
+│           │   └── constraints: [Field("amount") > Lit(1000)]
+│           └── extraction:
+│               └── AggregateExtract
+│                   ├── group_by: [Binding("user")]
+│                   └── shape:
+│                       ├── Field("user.name")
+│                       └── Alias("total", Agg(Sum, Field("order.amount")))
+```
+
+### 13.3 論理プランへの変換
+
+```
+論理プラン（S式表記）:
+
+(Aggregate
+  group_by: [user.id]
+  aggs: [(sum order.amount) as total]
+  (HashJoin inner
+    key: (user.id = order.user_id)
+    (Filter (= user.country "Japan")
+      (EntityScan "User"))
+    (Filter (> order.amount 1000)
+      (EntityScan "Order"))))
+
+最適化後:
+(Aggregate
+  group_by: [user.id]
+  aggs: [(sum order.amount) as total]
+  (HashJoin inner
+    key: (user.id = order.user_id)
+    (IndexScan "User" index:idx_country key:"Japan")     ← インデックス選択
+    (IndexScan "Order" index:idx_amount range:(1000,∞)))) ← インデックス選択
+```
+
+---
+
+## 14. 分散・ストリーム
+
+### 14.1 透過的分散
+
+```rel
+-- 書き方は完全に同じ。エンジンが自動分散。
+User -> .orders -> Order
+=> per(user.country) { country: user.country, revenue: sum(order.amount) }
+
+-- Scatter-Gather の流れ:
+-- Coordinator → 各シャードに部分クエリ送信
+-- 各シャード  → 部分集計して返す
+-- Coordinator → マージして最終結果
+```
+
+### 14.2 シャーディング宣言
+
+```rel
+entity Order {
+  ...
+  @shard(key: .user_id, strategy: hash, count: 256, replicas: 3)
+}
+```
+
+### 14.3 ストリーム処理
+
+```rel
+-- ストリーム定義
+stream OrderEvent from kafka("orders") {
+  schema: { order_id: UUID, user_id: UUID, amount: Decimal, ts: Timestamp }
+}
+
+-- ストリームクエリ（パターン言語そのまま使える）
+OrderEvent { amount > 10000 }
+  window tumbling(1m)
+  => per(.country) {
+    country: .country,
+    count:   count(),
+    revenue: sum(.amount)
+  }
+  -> sink kafka("revenue-metrics")
+
+-- ストリームとバッチの結合
+OrderEvent
+  enrich User on .user_id == user.id
+  => {
+    .order_id,
+    user.name,
+    user.country,
+    .amount
+  }
+```
+
+---
+
+## 15. SQLとの対比
+
+### 15.1 発想の違い
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│         SQL                       Rel                          │
+├─────────────────────────────────────────────────────────────────┤
+│  "usersテーブルを走査する"       "Userエンティティを探す"        │
+│  FROM users                      User { ... }                  │
+├─────────────────────────────────────────────────────────────────┤
+│  "WHERE句でフィルタする"         "パターンにマッチさせる"        │
+│  WHERE age > 18                  User { age > 18 }             │
+├─────────────────────────────────────────────────────────────────┤
+│  "ordersテーブルをJOINする"      "ordersリレーションを辿る"      │
+│  JOIN orders ON ...              -> .orders -> Order            │
+├─────────────────────────────────────────────────────────────────┤
+│  "カラムをSELECTする"            "欲しい形状を宣言する"          │
+│  SELECT name, amount             => { user.name, order.amount } │
+├─────────────────────────────────────────────────────────────────┤
+│  "GROUP BYで集約する"            "何単位で集計するか宣言する"    │
+│  GROUP BY user_id                per(user) { ... }             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 具体的なクエリ対比
+
+#### シンプルなクエリ
 ```sql
 -- SQL
-SELECT id, name, email FROM users WHERE age > 18 ORDER BY name LIMIT 10;
+SELECT id, name FROM users WHERE age > 18 ORDER BY name LIMIT 10;
 ```
 ```rel
 -- Rel
-from users
-|> where .age > 18
-|> order by .name
-|> take 10
-|> select { .id, .name, .email }
+User { age > 18 }
+sort (.name)
+take 10
+=> { .id, .name }
 ```
 
-#### 複数テーブルのJOIN
+#### JOIN
 ```sql
 -- SQL
-SELECT o.id, u.name, p.name AS product
+SELECT o.id, u.name, p.name
 FROM orders o
 JOIN users u ON o.user_id = u.id
 JOIN order_items oi ON o.id = oi.order_id
 JOIN products p ON oi.product_id = p.id
-WHERE u.country = 'JP'
-ORDER BY o.created_at DESC;
+WHERE u.country = 'Japan';
 ```
 ```rel
--- Rel
-from orders -> user -> order_items -> product
-|> where user.country == "JP"
-|> order by orders.created_at desc
-|> select {
-     order_id:    orders.id,
-     user_name:   user.name,
-     product_name: product.name
-   }
+-- Rel: JOINキーを一切書かない
+User { country: "Japan" } -> .orders -> .items -> Product
+=> { order.id, user.name, product.name }
 ```
 
-#### GROUP BY + HAVING
+#### GROUP BY / HAVING
 ```sql
 -- SQL
-SELECT country, COUNT(*) as cnt, AVG(age) as avg_age
-FROM users
-WHERE status = 'active'
+SELECT country, COUNT(*), SUM(amount)
+FROM orders
+JOIN users ON orders.user_id = users.id
+WHERE status = 'delivered'
 GROUP BY country
 HAVING COUNT(*) > 100
-ORDER BY cnt DESC;
+ORDER BY SUM(amount) DESC;
 ```
 ```rel
 -- Rel
-from users
-|> where .status == Status.Active
-|> group by .country
-|> having count() > 100
-|> order by count() desc
-|> select {
-     country: .country,
-     cnt:     count(),
-     avg_age: avg(.age)
-   }
+Order { status: Delivered } -> .user -> User
+=> per(user.country) {
+  country: user.country,
+  count:   count(order),
+  revenue: sum(order.amount)
+} where count > 100
+sort (revenue desc)
 ```
 
 #### 再帰クエリ
 ```sql
--- SQL（WITH RECURSIVEは複雑）
-WITH RECURSIVE subordinates AS (
-  SELECT id, name, manager_id, 0 AS depth
-  FROM employees
-  WHERE id = $root_id
+-- SQL（複雑）
+WITH RECURSIVE sub AS (
+  SELECT id, name, manager_id, 0 AS depth FROM employees WHERE id = $id
   UNION ALL
-  SELECT e.id, e.name, e.manager_id, s.depth + 1
-  FROM employees e
-  JOIN subordinates s ON e.manager_id = s.id
+  SELECT e.id, e.name, e.manager_id, s.depth+1
+  FROM employees e JOIN sub s ON e.manager_id = s.id
   WHERE s.depth < 10
 )
-SELECT * FROM subordinates;
+SELECT * FROM sub;
 ```
 ```rel
 -- Rel（直感的）
-from employees
-|> where .id == $root_id
-|> follow ~> reports(depth: 0..10)
-|> select { .id, .name, .depth }
+Employee { id: $id } ~> .reports(depth: 0..10)
+=> { .id, .name, .depth }
 ```
 
-#### NULL処理の違い
+#### ウィンドウ関数
 ```sql
--- SQL（三値論理で混乱しやすい）
-SELECT * FROM users WHERE phone IS NOT NULL;
-SELECT COALESCE(phone, 'N/A') FROM users;
--- NULL = NULL は FALSE (!)
--- NULL != NULL は NULL (!)
+-- SQL
+SELECT user_id, amount, created_at,
+  RANK() OVER (PARTITION BY user_id ORDER BY created_at DESC) as rank
+FROM orders;
 ```
 ```rel
--- Rel（Option型で明確）
-from users
-|> where .phone != None         -- Noneチェック
-|> select {
-     .name,
-     phone: .phone ?? "N/A"     -- デフォルト値
-   }
--- None == None は true（直感的）
+-- Rel
+Order
+=> {
+  .user_id, .amount, .created_at,
+  rank: rank() over user by .created_at desc
+}
 ```
 
-### 14.3 パフォーマンス特性
+### 15.3 機能比較表
 
-| 操作 | SQL (単一ノード) | Rel (分散) |
-|------|----------------|-----------|
-| シンプルなSELECT | ベースライン | 同等〜高速（インデックス最適化） |
-| 複雑なJOIN（10テーブル） | 遅くなりがち | 並列実行で高速 |
-| 大規模集計 (10億行) | 数時間 | 分単位（分散集計） |
-| リアルタイムストリーム | 非対応 | ミリ秒レイテンシ |
-| 再帰クエリ（深い階層） | 限界あり | 深さ制限付きで安全に実行 |
+| 機能 | SQL | Rel |
+|------|-----|-----|
+| データモデル | テーブル（2次元） | エンティティグラフ |
+| フィルタ記述 | WHERE句（別記） | パターン内 `{}` |
+| テーブル結合 | JOIN + ON句（毎回） | `->` 探索（定義済み） |
+| NULL処理 | 三値論理 | Option型（二値） |
+| 集計 | GROUP BY | `per()` |
+| 集計後フィルタ | HAVING | `where` after `per()` |
+| 再帰クエリ | WITH RECURSIVE | `~>` |
+| クエリ再利用 | VIEW / プロシージャ | `def`（合成可能） |
+| モジュール | なし | `module` |
+| 型安全 | 弱い | 強い静的型 |
+| コンパイル時検証 | ほぼなし | 型・リレーション全チェック |
+| 分散処理 | 方言依存 | ネイティブ組み込み |
+| ストリーム | なし | ネイティブ |
+| スキーマと言語 | 分離 | 統合（型定義=エンティティ定義） |
 
 ---
 
 ## 付録A: 完全なクエリ例
 
-### A.1 ECサイト — 月次売上レポート
+### ECサイト — ダッシュボード
 
 ```rel
-#!rel 0.1
-import analytics.*
-import std.datetime { format_date, date_trunc }
+-- 直近30日のKPI
+@report monthly_kpi(days: Int = 30) {
+  let orders = Order { created_at > now() - days.d, status: Delivered }
+  let users  = User { has(.orders { created_at > now() - days.d }) }
 
-query monthly_sales_report(year: Int) {
-  from orders
-  |> where date(.created_at).year == year
-  |> where .status != OrderStatus.Cancelled
-  |> navigate .order_items -> product
-  |> group by
-       month:   date_trunc("month", orders.created_at),
-       category: product.category
-  |> select {
-       month:          format_date(.month, "YYYY-MM"),
-       category:       .category,
-       total_revenue:  sum(order_items.quantity * product.price),
-       total_orders:   count(distinct orders.id),
-       total_items:    sum(order_items.quantity),
-       avg_order_val:  sum(order_items.quantity * product.price) / count(distinct orders.id)
-     }
-  |> order by .month desc, total_revenue desc
-}
-
--- 実行
-from monthly_sales_report(2026)
-|> where .total_revenue > 1000000
-```
-
-### A.2 SNS — フォロイーのタイムライン
-
-```rel
-query timeline(user_id: UUID, cursor: String?, limit: Int = 50) {
-  from users
-  |> where .id == user_id
-  |> navigate .following -> posts
-  |> where following.is_active == true
-  |> navigate posts -?> media       -- オプショナル
-  |> navigate posts -> author
-  |> order by posts.created_at desc, posts.id desc
-  |> cursor_paginate { after: cursor, per_page: limit }
-  |> select {
-       edges: {
-         id:          posts.id,
-         body:        posts.body,
-         created_at:  posts.created_at,
-         author: {
-           id:     author.id,
-           name:   author.name,
-           avatar: author.avatar_url
-         },
-         media: media?.map(m => { url: m.url, type: m.media_type })
-       },
-       page_info: { has_next_page, end_cursor }
-     }
+  return {
+    revenue:        orders sum(.amount),
+    order_count:    orders count(),
+    new_users:      User { created_at > now() - days.d } count(),
+    active_users:   users count(),
+    avg_order:      orders avg(.amount),
+    top_country:    (orders -> .user -> User
+                     => per(user.country) { country: user.country, rev: sum(order.amount) }
+                     sort (rev desc) take 1) first?.country
+  }
 }
 ```
 
-### A.3 不正検知 — リアルタイムストリーム
+### SNS — タイムライン
 
 ```rel
-import std.stats { z_score }
-import std.ml    { anomaly_detect }
+def timeline(user_id: UUID, cursor: String?, limit: Int = 50) =
+  User { id: user_id }
+  -> .following -> User
+  -> .posts { is_public: true }
+  -> Post
+  -?> .media -> Media
+  sort (post.created_at desc, post.id desc)
+  after cursor
+  take limit
 
--- ユーザーの通常取引パターンを事前計算
-@materialized(refresh: every 6h)
-query user_transaction_baseline {
-  from transactions
-  |> where .created_at >= now() - 90.days
-  |> group by .user_id
-  |> select {
-       user_id:    .user_id,
-       avg_amount: avg(.amount),
-       std_amount: stddev(.amount),
-       avg_hourly: count() / 90.0 / 24.0
-     }
+timeline($user_id, cursor: $cursor)
+=> {
+  edges: [{
+    id:         post.id,
+    body:       post.body,
+    created_at: post.created_at,
+    author: {   id: user.id, name: user.name, avatar: user.avatar_url },
+    media:  media?.map(m => { url: m.url, type: m.type })
+  }],
+  next_cursor: last(encode_cursor(post.created_at, post.id))
 }
+```
 
--- リアルタイムストリームで不正検知
-stream tx_events from kafka("transactions") {
-  format: json,
-  schema: Transaction
-}
+### 不正検知 — リアルタイム
 
-from tx_events
-|> navigate .user_id -> user_transaction_baseline as baseline
-|> let z = z_score(.amount, baseline.avg_amount, baseline.std_amount)
-|> where z > 3.0 or .amount > 500000
-|> select {
-     transaction_id: .id,
-     user_id:        .user_id,
-     amount:         .amount,
-     z_score:        z,
-     risk_level:     if z > 5.0 then "critical" else "high"
-   }
-|> sink alert_service("fraud-alerts")
+```rel
+-- バッチ側: ユーザーの通常パターンを事前計算
+@materialized(refresh: 6h)
+def user_baseline =
+  Order { created_at > now() - 90d } -> .user -> User
+  => per(user) {
+    user_id:       user.id,
+    avg_amount:    avg(order.amount),
+    stddev_amount: stddev(order.amount),
+    usual_country: mode(user.country)
+  }
+
+-- ストリーム側: リアルタイム検知
+OrderEvent
+  enrich user_baseline on .user_id == baseline.user_id
+  let z = (.amount - baseline.avg_amount) / (baseline.stddev_amount + 0.01)
+  let mismatch = .country != baseline.usual_country
+  where z > 3.0 or mismatch
+  => {
+    .order_id, .user_id, .amount,
+    z_score:          z,
+    country_mismatch: mismatch,
+    risk_level:       z > 5.0 ? Critical : High
+  }
+  -> sink fraud_alerts
 ```
 
 ---
 
-## 付録B: 文法仕様（EBNF）
-
-```ebnf
-program         ::= statement*
-statement       ::= query_def | entity_def | relation_def | import_stmt | module_def
-
-query_def       ::= annotation* "query" IDENT params? "{" pipeline "}"
-params          ::= "(" param ("," param)* ")"
-param           ::= IDENT ":" type ("=" expr)?
-
-pipeline        ::= source ("|>" operator)*
-source          ::= "from" source_expr
-source_expr     ::= IDENT ("->" IDENT)*
-operator        ::= where_op | select_op | group_op | order_op | take_op | navigate_op | window_op | having_op
-
-where_op        ::= "where" expr
-select_op       ::= "select" projection
-group_op        ::= "group" "by" expr ("," expr)*
-having_op       ::= "having" expr
-order_op        ::= "order" "by" order_term ("," order_term)*
-order_term      ::= expr ("asc" | "desc")?
-take_op         ::= "take" expr ("skip" expr)?
-navigate_op     ::= "navigate" nav_expr
-
-nav_expr        ::= "." IDENT nav_type?
-nav_type        ::= "->" | "-?>" | "<-" | "<->" | "~>"
-
-projection      ::= expr | "{" proj_field ("," proj_field)* "}"
-proj_field      ::= IDENT ":" expr | "." IDENT | spread_expr
-spread_expr     ::= "..." expr
-
-entity_def      ::= annotation* "entity" IDENT "{" field_def* "}"
-field_def       ::= IDENT ":" type annotation* NEWLINE
-
-relation_def    ::= "relation" IDENT "." IDENT nav_type IDENT type? ("via" IDENT)?
-
-type            ::= base_type | option_type | list_type | map_type
-base_type       ::= IDENT ("(" INT ("," INT)? ")")?
-option_type     ::= type "?"
-list_type       ::= "List" "<" type ">"
-map_type        ::= "Map" "<" type "," type ">"
-
-expr            ::= literal | field_access | binary_expr | unary_expr | call_expr | match_expr
-field_access    ::= "." IDENT ("." IDENT)*
-binary_expr     ::= expr op expr
-op              ::= "==" | "!=" | "<" | "<=" | ">" | ">=" | "and" | "or" | "+" | "-" | "*" | "/" | "??" | "++"
-call_expr       ::= IDENT "(" (expr ("," expr)*)? ")"
-match_expr      ::= "match" expr "{" match_arm+ "}"
-match_arm       ::= pattern "=>" expr ","
-
-annotation      ::= "@" IDENT ("(" annotation_args ")")?
-import_stmt     ::= "import" module_path ("{" IDENT ("," IDENT)* "}")?
-module_def      ::= "module" IDENT "{" statement* "}"
-```
-
----
-
-## 付録C: エラーメッセージ設計
-
-Relのコンパイラは人間が読めるエラーメッセージを出力する。
+## 付録B: エラーメッセージ例
 
 ```
-Error[E001]: Type mismatch
-  --> query.rel:5:14
+Error[E001]: Type mismatch in entity pattern
+  --> query.rel:3:12
   |
-5 |  |> where .age > "adult"
-  |                  ^^^^^^^
-  |                  expected Int, found String
+3 |  User { age > "adult" }
+  |               ^^^^^^^
+  |               expected Int (field 'age' is Int), found String
   |
-  hint: .age is of type Int. To compare with a string,
-        try parsing: .age > Int.parse("18")
-        or use a literal: .age > 18
+  hint: Did you mean `age > 18`?
 
 Error[E042]: Unknown relation
-  --> query.rel:3:14
+  --> query.rel:5:9
   |
-3 |  from orders -> payment
-  |                 ^^^^^^^
-  |                 relation 'payment' not found on entity 'Order'
+5 |  User -> .payment -> Payment
+  |           ^^^^^^^
+  |           relation 'payment' not found on entity 'User'
   |
-  hint: Did you mean 'Order.user'?
-        Available relations: user, order_items, coupon?
+  hint: Available relations on User: orders, profile, tags, following
+        Did you mean `Order -> .payment`?
 
-Error[E103]: Non-nullable field accessed as nullable
-  --> query.rel:8:12
+Error[E050]: Non-aggregate field in per() context
+  --> query.rel:9:5
   |
-8 |  |> select .email ?? "no-email"
-  |             ^^^^^
-  |             'email' is required (non-nullable), '??' is unnecessary
+9 |    order.id,          <- ここが問題
+  |    ^^^^^^^^
+  |    'order.id' is not in per(user) group key and is not an aggregate
   |
-  hint: Remove the '??' operator, or change the schema to: email: String?
+  hint: Use `first(order.id)`, `collect(order.id)`, or add `order` to per()
+
+Error[E070]: Option type used without unwrapping
+  --> query.rel:12:18
+  |
+12|  => { phone: user.phone.to_upper() }
+  |                    ^^^^^
+  |                    'phone' is Option<String>. Cannot call .to_upper() directly.
+  |
+  hint: Use `user.phone?.to_upper()` or `user.phone!.to_upper()`
 ```
 
 ---
 
-*Rel Language Specification v0.1.0-draft*
+*Rel Language Specification v0.2.0-draft*
 *Copyright 2026 — Rel Language Design Group*

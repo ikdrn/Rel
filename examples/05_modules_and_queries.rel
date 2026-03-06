@@ -1,340 +1,249 @@
-#!rel 0.1
+#!rel 0.2
 --
--- Rel Language Examples: 05 — Modules & Reusable Queries
--- モジュール・再利用可能なクエリの例
+-- Rel Language Examples: 05 — Named Patterns & Modules
+-- クエリの再利用は def で定義する。
+-- VIEW や Stored Procedure の代わりになる。
 --
 
+
 -- ============================================================
--- 1. モジュール定義
+-- 1. def — 名前付きパターンの定義
+-- ============================================================
+
+-- 基本パターン（引数なし）
+def active_users =
+  User { status: Active, deleted_at: None }
+
+-- 合成（active_users を拡張）
+def adult_users   = active_users { age >= 18 }
+def premium_users = active_users { plan: Premium | plan: Enterprise }
+def japan_users   = active_users { country: "Japan" }
+
+-- さらに合成
+def japan_premium = japan_users { plan: Premium | plan: Enterprise }
+
+-- 使い方（通常のエンティティパターンと同じ）
+japan_premium
+sort (.name)
+=> { .id, .name, .email }
+
+
+-- ============================================================
+-- 2. パラメータ付きパターン
+-- ============================================================
+
+-- 引数を取るパターン
+def users_in(country: String) = active_users { country }
+
+def orders_since(days: Int) =
+  Order {
+    created_at > now() - days.d,
+    status: Delivered
+  }
+
+def products_under(max_price: Price) =
+  Product { price < max_price, is_active: true, stock > 0 }
+
+-- 使用例
+users_in("Japan") -> .orders -> orders_since(30)
+=> per(user) { user.name, revenue: sum(order.amount) }
+sort (revenue desc)
+take 10
+
+
+-- ============================================================
+-- 3. パターンの合成・ネスト
+-- ============================================================
+
+-- ソート・ページング込みのパターン
+def top_customers(limit: Int = 10, days: Int = 30) =
+  User -> .orders -> orders_since(days)
+  => per(user) {
+    user.name,
+    user.email,
+    total:  sum(order.amount),
+    count:  count(order)
+  }
+  sort (total desc)
+  take limit
+
+-- 使用
+top_customers(limit: 5, days: 90)
+
+-- 国別トップ
+users_in("Japan") -> .orders -> orders_since(30)
+=> per(user) {
+  user.name,
+  total: sum(order.amount)
+}
+sort (total desc)
+take 10
+
+
+-- ============================================================
+-- 4. マテリアライズドパターン（事前計算・キャッシュ）
+-- ============================================================
+
+-- 定期更新でキャッシュ（重いクエリを事前計算）
+@materialized(refresh: 1h)
+def daily_stats =
+  Order { status: Delivered }
+  => per(.created_at.date) {
+    date:    .created_at.date,
+    revenue: sum(.amount),
+    orders:  count()
+  }
+  sort (.date)
+
+@materialized(refresh: 6h)
+def product_ranking =
+  OrderItem -> .product -> Product
+  => per(product) {
+    product.id,
+    product.name,
+    units_sold: sum(item.qty),
+    revenue:    sum(item.total_price)
+  }
+  sort (revenue desc)
+
+-- マテリアライズドパターンは通常と同じように使える
+daily_stats { date > now() - 30d }
+=> { .date, .revenue }
+
+
+-- ============================================================
+-- 5. モジュール定義
 -- ============================================================
 
 module analytics {
-
   import ecommerce.*
-  import std.datetime { now, date_trunc, date_diff, format_date }
-  import std.stats    { percentile, stddev }
+  import std.time.*
 
-  -- ─────────────────────────────────────────────────────────
-  -- 基本クエリ（パラメータなし）
-  -- ─────────────────────────────────────────────────────────
+  -- エクスポートしたパターンは外部から使える
+  export def active_users = User { status: Active }
 
-  -- アクティブユーザー一覧
-  export query active_users {
-    from users
-    |> where .status == UserStatus.Active
-    |> where .deleted_at == None
-  }
+  export def revenue_by_country =
+    Order { status: Delivered } -> .user -> User
+    => per(user.country) {
+      country: user.country,
+      revenue: sum(order.amount),
+      orders:  count(order)
+    }
+    sort (revenue desc)
 
-  -- 成人ユーザー
-  export query adult_users {
-    from active_users
-    |> where .age >= 18
-  }
+  export def top_products(n: Int = 10) =
+    OrderItem -> .product -> Product
+    => per(product) {
+      product.name,
+      product.category,
+      units:   sum(item.qty),
+      revenue: sum(item.total_price)
+    }
+    sort (revenue desc)
+    take n
 
-  -- 直近30日の完了注文
-  export query recent_completed_orders {
-    from orders
-    |> where .status == OrderStatus.Delivered
-    |> where .created_at >= now() - 30.days
-  }
+  @materialized(refresh: 1h)
+  export def daily_kpi =
+    Order { status: Delivered }
+    => per(.created_at.date) {
+      date:    .created_at.date,
+      revenue: sum(.amount),
+      orders:  count(),
+      avg:     avg(.amount)
+    }
 
-  -- ─────────────────────────────────────────────────────────
-  -- パラメータ付きクエリ
-  -- ─────────────────────────────────────────────────────────
-
-  -- 国別ユーザー
-  export query users_by_country(country: String) {
-    from active_users
-    |> where .country == country
-  }
-
-  -- 期間指定クエリ
-  export query orders_in_range(from_date: Date, to_date: Date) {
-    from orders
-    |> where date(.created_at) >= from_date
-    |> where date(.created_at) <= to_date
-    |> where .status != OrderStatus.Cancelled
-  }
-
-  -- ページング付きユーザー一覧
-  export query paginated_users(page: Int = 0, per_page: Int = 20) {
-    from active_users
-    |> order by .created_at desc
-    |> take per_page skip (page * per_page)
-    |> select { .id, .name, .email, .created_at }
-  }
-
-  -- ─────────────────────────────────────────────────────────
-  -- 集計クエリ
-  -- ─────────────────────────────────────────────────────────
-
-  -- 国別売上
-  export query revenue_by_country {
-    from recent_completed_orders -> user
-    |> group by user.country
-    |> select {
-         country:       user.country,
-         total_revenue: sum(orders.amount),
-         order_count:   count(),
-         avg_order:     avg(orders.amount)
-       }
-    |> order by total_revenue desc
-  }
-
-  -- トップ顧客
-  export query top_customers(limit: Int = 10, days: Int = 30) {
-    from users -> orders
-    |> where orders.created_at >= now() - days.days
-    |> where orders.status == OrderStatus.Delivered
-    |> group by users.id, users.name, users.email
-    |> select {
-         id:          users.id,
-         name:        users.name,
-         email:       users.email,
-         total_spent: sum(orders.amount),
-         order_count: count()
-       }
-    |> order by total_spent desc
-    |> take limit
-  }
-
-  -- 月次売上レポート
-  export query monthly_revenue(year: Int) {
-    from orders
-    |> where date(.created_at).year == year
-    |> where .status == OrderStatus.Delivered
-    |> group by date_trunc("month", .created_at) as month
-    |> select {
-         month:   format_date(.month, "YYYY-MM"),
-         revenue: sum(.amount),
-         orders:  count()
-       }
-    |> order by .month
-  }
-
-  -- ─────────────────────────────────────────────────────────
-  -- マテリアライズドクエリ（定期更新・キャッシュ）
-  -- ─────────────────────────────────────────────────────────
-
-  @materialized(refresh: every 1h)
-  export query daily_stats {
-    from orders
-    |> where .created_at >= now() - 90.days
-    |> group by date(.created_at) as day
-    |> select {
-         day:     .day,
-         revenue: sum(.amount),
-         orders:  count(),
-         avg:     avg(.amount)
-       }
-    |> order by .day
-  }
-
-  @materialized(refresh: every 6h)
-  export query product_stats {
-    from products -> order_items
-    |> group by products.id, products.name, products.category_id
-    |> select {
-         product_id:   products.id,
-         product_name: products.name,
-         category_id:  products.category_id,
-         total_sold:   sum(order_items.quantity),
-         total_revenue: sum(order_items.total_price),
-         avg_rating:   avg(products.rating)
-       }
-  }
-
-  -- ─────────────────────────────────────────────────────────
-  -- プライベートヘルパー（export なし）
-  -- ─────────────────────────────────────────────────────────
-
-  query _valid_orders {
-    from orders
-    |> where .status not in [OrderStatus.Cancelled, OrderStatus.Draft]
-  }
-
+  -- プライベート（export なし）
+  def _base = Order { status: Delivered }
 }
 
 
 -- ============================================================
--- 2. モジュールの使用
+-- 6. モジュールの使用
 -- ============================================================
 
--- 単一クエリのインポート
 import analytics.revenue_by_country
-
-from revenue_by_country
-|> take 5
-
-
--- 名前空間付きインポート
+import analytics { top_products, daily_kpi }
 import analytics as an
 
-from an.top_customers(limit: 20, days: 90)
-|> select { .name, .total_spent }
+-- 使用
+revenue_by_country take 5
 
+top_products(n: 20)
 
--- 複数インポート
-import analytics { active_users, monthly_revenue, top_customers }
-
-from active_users
-|> where .country == "Japan"
-|> order by .name
+an.daily_kpi { date > now() - 7d }
+=> { .date, .revenue, .orders }
 
 
 -- ============================================================
--- 3. クエリの合成（Composition）
+-- 7. 動的パターン（条件付きフィルタ）
 -- ============================================================
 
--- 基底クエリを拡張して新しいクエリを作る
-import analytics.active_users
+-- 引数に応じてフィルタが変わるパターン
+def search_products(
+  keyword:       String?  = None,
+  category_id:   UUID?    = None,
+  min_price:     Price?   = None,
+  max_price:     Price?   = None,
+  in_stock_only: Bool     = false
+) =
+  Product {
+    is_active:   true,
+    name:        keyword   != None ? ~ keyword! : any,
+    category_id: category_id != None ? category_id! : any,
+    price:       min_price != None ? >= min_price! : any,
+    price:       max_price != None ? <= max_price! : any,
+    stock:       in_stock_only ? > 0 : any
+  }
+  sort (.created_at desc)
 
--- 日本のプレミアムユーザー
-query japan_premium_users {
-  from active_users
-  |> where .country == "Japan"
-  |> where .plan == "premium"
-}
-
--- さらに絞り込み（直近90日以内にログインしたもの）
-query japan_premium_active {
-  from japan_premium_users
-  |> where .last_login_at >= now() - 90.days
-}
-
-
--- ============================================================
--- 4. 高階クエリ（クエリを引数に取る関数）
--- ============================================================
-
--- 任意のクエリにページングを適用
-query with_pagination<T>(
-  base:     Query<T>,
-  page:     Int = 0,
-  per_page: Int = 20
-) -> Query<T> {
-  from base
-  |> take per_page skip (page * per_page)
-}
-
--- 使用例
-from with_pagination(japan_premium_active, page: 2, per_page: 50)
-|> select { .id, .name, .email }
-
-
--- ============================================================
--- 5. 条件付きクエリ組み立て
--- ============================================================
-
--- 動的フィルタ（パラメータに応じてフィルタを切り替え）
-query search_products(
-  keyword:      String?,
-  category_id:  UUID?,
-  min_price:    Price?,
-  max_price:    Price?,
-  in_stock_only: Bool = false
-) {
-  from products
-  |> where .is_active == true
-  |> where if keyword != None then .name like ("%" ++ keyword! ++ "%") else true
-  |> where if category_id != None then .category_id == category_id! else true
-  |> where if min_price != None then .price >= min_price! else true
-  |> where if max_price != None then .price <= max_price! else true
-  |> where if in_stock_only then .stock > 0 else true
-  |> order by .created_at desc
-}
-
--- 使用例
-from search_products(
+-- 使用
+search_products(
   keyword:      "スマートフォン",
-  category_id:  None,
   min_price:    50000,
   max_price:    100000,
   in_stock_only: true
 )
-|> select { .id, .name, .price, .stock }
+=> { .id, .name, .price, .stock }
 
 
 -- ============================================================
--- 6. クエリのバリデーション・アサーション
--- ============================================================
-
-query user_by_id(id: UUID) -> User {
-  from users
-  |> where .id == id
-  |> single!()     -- 1件のみ。0件または2件以上はエラー
-}
-
-query user_by_email(email: Email) -> User? {
-  from users
-  |> where .email == email
-  |> first()       -- 0件の場合は None を返す
-}
-
--- 使用例
-let user = user_by_id($user_id)    -- User型（Noneでない）
-let user = user_by_email($email)   -- User?型（Noneの可能性あり）
-
-
--- ============================================================
--- 7. トランザクション内でのクエリ使用
+-- 8. トランザクション内でのパターン使用
 -- ============================================================
 
 transaction create_order($user_id: UUID, $items: List<{product_id: UUID, qty: Int}>) {
-  isolation: serializable
+  isolation: Serializable
   timeout:   30s
 
-  steps {
-    -- ユーザー確認
-    let user = from users
-               |> where .id == $user_id
-               |> where .status == UserStatus.Active
-               |> single!()
+  let user = active_users { id: $user_id } one
 
-    -- 在庫確認・確保（ロック付き）
-    let reserved_items = from products
-                         |> where .id in $items.map(|i| i.product_id)
-                         |> lock(for: update)
-                         |> select { .id, .name, .price, .stock }
-
-    -- 在庫不足チェック
-    for item in $items {
-      let product = reserved_items |> where .id == item.product_id |> single!()
-      guard product.stock >= item.qty
-        else Error.InsufficientStock { product_id: item.product_id, available: product.stock }
-
-      -- 在庫を減らす
-      update products
-      |> where .id == item.product_id
-      |> set { stock: product.stock - item.qty }
-    }
-
-    -- 注文作成
-    let total = $items.sum(|i| {
-      let p = reserved_items |> where .id == i.product_id |> single!()
-      p.price * i.qty
-    })
-
-    let order_id = insert Order {
-      user_id:      $user_id,
-      status:       OrderStatus.Pending,
-      total_amount: total,
-      shipping_address: user.address!
-    }
-
-    -- 注文アイテム作成
-    for item in $items {
-      let product = reserved_items |> where .id == item.product_id |> single!()
-      insert OrderItem {
-        order_id:    order_id,
-        product_id:  item.product_id,
-        quantity:    item.qty,
-        unit_price:  product.price,
-        total_price: product.price * item.qty,
-        snapshot:    { name: product.name, price: product.price }
-      }
-    }
-
-    return { order_id, total }
+  -- 在庫確保（ロック付き）
+  for item in $items {
+    let product = Product { id: item.product_id } lock(write) one
+    guard product.stock >= item.qty else InsufficientStock { available: product.stock }
+    product update { stock: product.stock - item.qty }
   }
+
+  let total = $items.sum(|i| {
+    let p = Product { id: i.product_id } one
+    p.price * i.qty
+  })
+
+  let order = create Order {
+    user_id:          $user_id,
+    total_amount:     total,
+    shipping_address: user.address!
+  }
+
+  for item in $items {
+    let p = Product { id: item.product_id } one
+    create OrderItem {
+      order_id:   order.id,
+      product_id: item.product_id,
+      qty:        item.qty,
+      unit_price: p.price,
+      snapshot:   { name: p.name, price: p.price }
+    }
+  }
+
+  return { order_id: order.id, total }
 }

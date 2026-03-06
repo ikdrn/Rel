@@ -1,273 +1,234 @@
-#!rel 0.1
+#!rel 0.2
 --
 -- Rel Language Examples: 03 — Aggregation & Analytics
--- 集計・分析クエリの例
+-- GROUP BY は存在しない。
+-- per() で「何単位で集計するか」を宣言する。
 --
 
-import std.datetime { now, date_trunc, format_date }
-import std.stats    { percentile, correlation }
+import std.time.*
+import std.stats.*
 
 
 -- ============================================================
--- 1. 基本的なGROUP BY
+-- 1. per() — 集計の基本
 -- ============================================================
 
 -- SQL: SELECT country, COUNT(*) FROM users GROUP BY country
--- Rel:
-from users
-|> group by .country
-|> select {
-     country: .country,
-     count:   count()
-   }
+--
+-- Rel: "ユーザーを国ごとに集計する"
+User
+=> per(.country) {
+  country: .country,
+  count:   count()
+}
 
--- 複数フィールドでのGROUP BY
-from orders
-|> group by .status, .country
-|> select {
-     .status,
-     .country,
-     total:   count(),
-     revenue: sum(.amount)
-   }
+-- SQL: SELECT status, country, COUNT(*), SUM(amount) FROM orders GROUP BY status, country
+Order
+=> per(.status, .country) {
+  .status,
+  .country,
+  total:   count(),
+  revenue: sum(.amount)
+}
 
 
 -- ============================================================
--- 2. HAVING（集計後フィルタ）
+-- 2. エンティティ単位の集計
 -- ============================================================
 
--- 100人以上のユーザーがいる国
-from users
-|> group by .country
-|> having count() >= 100
-|> select {
-     .country,
-     user_count: count()
-   }
-|> order by user_count desc
+-- SQL:
+--   SELECT u.id, u.name, COUNT(o.id), SUM(o.amount)
+--   FROM users u JOIN orders o ON o.user_id = u.id
+--   GROUP BY u.id, u.name
+
+-- Rel: "ユーザーごとに注文を集計する"
+User { country: "Japan" } -> .orders -> Order
+=> per(user) {
+  user.name,
+  order_count:   count(order),
+  total_revenue: sum(order.amount),
+  avg_order:     avg(order.amount),
+  last_order_at: max(order.created_at)
+}
+
+
+-- ============================================================
+-- 3. HAVING 相当（集計後フィルタ）
+-- ============================================================
+
+-- SQL: ... HAVING COUNT(*) >= 100
+User
+=> per(.country) {
+  .country,
+  count: count()
+} where count >= 100
+sort (count desc)
 
 -- 売上1億円以上のカテゴリ
-from order_items -> product -> category
-|> group by category.name
-|> having sum(order_items.quantity * product.price) >= 100000000
-|> select {
-     category:      category.name,
-     total_revenue: sum(order_items.quantity * product.price)
-   }
-|> order by total_revenue desc
+Product -> .category -> Category
+Order { status: Delivered } -> .items -> OrderItem -> .product -> Product
+=> per(category) {
+  category.name,
+  revenue: sum(item.total_price)
+} where revenue >= 100_000_000
+sort (revenue desc)
 
 
 -- ============================================================
--- 3. 時系列集計
+-- 4. 複数レベルの集計
+-- ============================================================
+
+-- ユーザーごと・ステータスごと
+User -> .orders -> Order
+=> per(user, order.status) {
+  user.name,
+  status:  order.status,
+  count:   count(order),
+  revenue: sum(order.amount)
+}
+
+-- 日付ごと・国ごと
+Order { status: Delivered }
+=> per(.created_at.date, .country) {
+  date:    .created_at.date,
+  country: .country,
+  revenue: sum(.amount),
+  orders:  count()
+}
+sort (.date desc)
+
+
+-- ============================================================
+-- 5. 時系列集計
 -- ============================================================
 
 -- 日別売上
-from orders
-|> where .status == "completed"
-|> group by date_trunc("day", .created_at) as day
-|> select {
-     day:           format_date(.day, "YYYY-MM-DD"),
-     order_count:   count(),
-     total_revenue: sum(.amount),
-     avg_order:     avg(.amount)
-   }
-|> order by .day
+Order { status: Delivered }
+=> per(.created_at.truncate("day")) {
+  day:     .created_at.truncate("day"),
+  revenue: sum(.amount),
+  orders:  count()
+}
+sort (.day)
 
--- 週別・月別比較
-from orders
-|> where .created_at >= now() - 365.days
-|> group by {
-     week:  date_trunc("week",  .created_at),
-     month: date_trunc("month", .created_at)
-   }
-|> select {
-     week:    .week,
-     month:   .month,
-     revenue: sum(.amount),
-     orders:  count()
-   }
+-- 月別
+Order { status: Delivered, created_at > now() - 365d }
+=> per(.created_at.truncate("month")) {
+  month:   format(.created_at.truncate("month"), "YYYY-MM"),
+  revenue: sum(.amount),
+  orders:  count()
+}
+sort (.month)
 
--- 時間帯別分析
-from orders
-|> group by hour_of_day(.created_at) as hour
-|> select {
-     hour:          .hour,
-     order_count:   count(),
-     total_revenue: sum(.amount)
-   }
-|> order by .hour
+-- 時間帯別
+Order
+=> per(.created_at.hour) {
+  hour:    .created_at.hour,
+  orders:  count(),
+  revenue: sum(.amount)
+}
+sort (.hour)
 
 
 -- ============================================================
--- 4. ウィンドウ関数
+-- 6. ウィンドウ関数
 -- ============================================================
 
--- ユーザーごとの注文をランキング（最新が1位）
-from orders
-|> window {
-     rank: rank() over (
-       partition by .user_id
-       order by .created_at desc
-     )
-   }
-|> where .rank <= 3    -- 各ユーザーの直近3件のみ
-|> select { .user_id, .id, .amount, .created_at, .rank }
+-- 注文をユーザーごとにランキング（直近順）
+Order -> .user -> User
+=> {
+  user.name,
+  order.amount,
+  order.created_at,
+  rank:          rank()          over user by order.created_at desc,
+  running_total: sum(order.amount) over user by order.created_at
+}
 
+-- 前日比
+-- （daily_stats はマテリアライズドパターン、後述）
+daily_stats
+=> {
+  .date,
+  .revenue,
+  prev_day:   lag(.revenue, 1) over () by .date,
+  day_over_day: (.revenue - lag(.revenue, 1) over () by .date)
+                / lag(.revenue, 1) over () by .date * 100
+}
 
--- 累積売上（ランニングトータル）
-from orders
-|> where .status == "completed"
-|> order by .created_at
-|> window {
-     running_revenue: sum(.amount) over (
-       order by .created_at
-       rows unbounded preceding to current row
-     ),
-     running_count: count() over (
-       order by .created_at
-       rows unbounded preceding to current row
-     )
-   }
-|> select {
-     .created_at,
-     .amount,
-     .running_revenue,
-     .running_count
-   }
-
-
--- 前日比・前週比
-from daily_revenue    -- マテリアライズドクエリ
-|> window {
-     prev_day_revenue:  lag(.revenue, 1) over (order by .date),
-     prev_week_revenue: lag(.revenue, 7) over (order by .date)
-   }
-|> select {
-     .date,
-     .revenue,
-     day_over_day:  (.revenue - .prev_day_revenue) / .prev_day_revenue * 100,
-     week_over_week: (.revenue - .prev_week_revenue) / .prev_week_revenue * 100
-   }
-
-
--- 移動平均（7日間）
-from daily_revenue
-|> window {
-     moving_avg_7d: avg(.revenue) over (
-       order by .date
-       rows 6 preceding to current row
-     )
-   }
-|> select { .date, .revenue, .moving_avg_7d }
-
-
--- パーセンタイル（ウィンドウ内）
-from orders
-|> window {
-     percentile_rank: percent_rank() over (
-       partition by .country
-       order by .amount
-     )
-   }
-|> select {
-     .id,
-     .amount,
-     .country,
-     top_10_percent: .percentile_rank >= 0.9
-   }
+-- パーセンタイルランク（国ごとの売上ランク）
+Order -> .user -> User
+=> {
+  .id, .amount, user.country,
+  pct_rank: percent_rank() over user.country by .amount
+}
 
 
 -- ============================================================
--- 5. 統計分析
+-- 7. コレクション集計
 -- ============================================================
 
-import std.stats { stddev, variance, median, percentile, correlation, z_score }
-
--- 基本統計量
-from products
-|> group by .category
-|> select {
-     category:    .category,
-     count:       count(),
-     avg_price:   avg(.price),
-     min_price:   min(.price),
-     max_price:   max(.price),
-     stddev:      stddev(.price),
-     median:      median(.price),
-     p25:         percentile(.price, 0.25),
-     p75:         percentile(.price, 0.75),
-     p95:         percentile(.price, 0.95)
-   }
+-- ユーザーの全タグをリストで収集
+User -> .orders -> Order
+=> per(user) {
+  user.name,
+  order_ids:      collect(order.id),
+  order_statuses: collect(distinct order.status),
+  has_cancelled:  any(order.status == Cancelled),
+  all_delivered:  all(order.status == Delivered)
+}
 
 
 -- ============================================================
--- 6. PIVOT（横展開）
+-- 8. 統計分析
 -- ============================================================
 
--- 月別・カテゴリ別売上をPIVOT
-from order_items -> product -> category -> orders
-|> group by date_trunc("month", orders.created_at) as month, category.name
-|> pivot {
-     rows: .month,
-     cols: category.name,
-     value: sum(order_items.quantity * product.price),
-     fill: 0.0
-   }
-|> select {
-     month:       format_date(.month, "YYYY-MM"),
-     electronics: .Electronics ?? 0,
-     clothing:    .Clothing ?? 0,
-     food:        .Food ?? 0
-   }
+Product
+=> per(.category) {
+  category:   .category,
+  count:      count(),
+  avg_price:  avg(.price),
+  min_price:  min(.price),
+  max_price:  max(.price),
+  stddev:     stddev(.price),
+  median:     median(.price),
+  p25:        percentile(.price, 0.25),
+  p75:        percentile(.price, 0.75),
+  p95:        percentile(.price, 0.95)
+}
 
 
 -- ============================================================
--- 7. コホート分析
+-- 9. コホート分析
 -- ============================================================
 
--- ユーザーコホート（登録月別のリテンション分析）
-let user_cohorts =
-  from users
-  |> select {
-       .id,
-       cohort_month: date_trunc("month", .created_at)
-     }
-
-let user_activity =
-  from orders -> user
-  |> select {
-       user.id,
-       activity_month: date_trunc("month", orders.created_at)
-     }
-  |> distinct by (.id, .activity_month)
-
-from user_cohorts -> user_activity on user_cohorts.id == user_activity.id
-|> group by user_cohorts.cohort_month, user_activity.activity_month
-|> select {
-     cohort_month:   user_cohorts.cohort_month,
-     activity_month: user_activity.activity_month,
-     month_offset:   date_diff("month", user_cohorts.cohort_month, user_activity.activity_month),
-     active_users:   count(distinct user_cohorts.id)
-   }
-|> order by user_cohorts.cohort_month, .month_offset
+-- 登録月ごとのリテンション
+User -> .orders -> Order
+=> per(user.created_at.truncate("month"), order.created_at.truncate("month")) {
+  cohort:         user.created_at.truncate("month"),
+  activity_month: order.created_at.truncate("month"),
+  month_offset:   diff_months(user.created_at, order.created_at),
+  active_users:   count(distinct user.id)
+}
+sort (.cohort, .month_offset)
 
 
 -- ============================================================
--- 8. ファネル分析
+-- 10. SQLとの直接対応
 -- ============================================================
 
--- コンバージョンファネル（セッション → 商品閲覧 → カート → 購入）
-from users
-|> let viewed    = count(from page_views   |> where .user_id == users.id and .page_type == "product")
-|> let carted    = count(from cart_events  |> where .user_id == users.id)
-|> let purchased = count(from orders       |> where .user_id == users.id)
-|> group by true    -- 全体集計
-|> select {
-     total_users:       count(),
-     viewed_product:    count(viewed > 0),
-     added_to_cart:     count(carted > 0),
-     completed_purchase: count(purchased > 0),
-     view_rate:         count(viewed > 0) / count() * 100,
-     cart_rate:         count(carted > 0) / count(viewed > 0) * 100,
-     purchase_rate:     count(purchased > 0) / count(carted > 0) * 100
-   }
+-- SQL:
+--   SELECT country, COUNT(*), AVG(age)
+--   FROM users
+--   WHERE status = 'active'
+--   GROUP BY country
+--   HAVING COUNT(*) > 100
+--   ORDER BY COUNT(*) DESC
+
+-- Rel:
+User { status: Active }
+=> per(.country) {
+  country: .country,
+  cnt:     count(),
+  avg_age: avg(.age)
+} where cnt > 100
+sort (cnt desc)

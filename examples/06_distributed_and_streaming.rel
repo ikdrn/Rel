@@ -1,300 +1,217 @@
-#!rel 0.1
+#!rel 0.2
 --
 -- Rel Language Examples: 06 — Distributed Queries & Stream Processing
--- 分散クエリ・ストリーム処理の例
+-- 分散・ストリーム処理もパターン言語で統一的に記述する。
 --
 
-import std.datetime { now, date_trunc, format_date }
-import std.ml       { anomaly_score }
-import std.geo      { distance, within_radius }
+import std.time.*
+import std.stats.*
 
 
 -- ============================================================
 -- 1. 分散クエリ（透過的分散）
 -- ============================================================
 
--- 通常と全く同じ構文で書く。エンジンが自動分散実行
-from orders
-|> where .created_at >= now() - 30.days
-|> group by .country
-|> select {
-     country: .country,
-     revenue: sum(.amount),
-     orders:  count()
-   }
-|> order by revenue desc
-
--- ヒント付き分散クエリ（パフォーマンスチューニング時）
-from orders @shard_hint(key: .user_id, value: $user_id)
-|> where .user_id == $user_id
-|> order by .created_at desc
-|> take 20
-
-
--- ============================================================
--- 2. 分散集計の明示的制御
--- ============================================================
-
--- 2段階集計の明示的定義（超大規模データ向け）
-query global_revenue_by_category {
-  -- Phase 1: 各シャードで部分集計
-  let partial = from orders -> order_items -> product -> category
-                |> where orders.status == "delivered"
-                |> group by category.id, category.name
-                |> aggregate {
-                     partial_revenue: sum(order_items.total_price),
-                     partial_count:   count(distinct orders.id)
-                   }
-                @execution(phase: scatter, parallelism: 256)
-
-  -- Phase 2: Coordinatorで最終集計
-  from partial
-  |> group by .category_id, .category_name
-  |> select {
-       category:      .category_name,
-       total_revenue: sum(.partial_revenue),
-       total_orders:  sum(.partial_count)
-     }
-  |> order by total_revenue desc
-  @execution(phase: gather)
+-- 書き方は完全にシングルノードと同じ。
+-- エンジンが自動的にシャードに分散して実行する。
+Order { created_at > now() - 30d }
+=> per(.country) {
+  country: .country,
+  revenue: sum(.amount),
+  orders:  count()
 }
+sort (revenue desc)
+
+-- 特定シャードへのヒント（チューニング時）
+Order @shard_hint(.user_id, $user_id) { user_id: $user_id }
+sort (.created_at desc)
+take 20
+=> { .id, .amount, .status, .created_at }
+
+
+-- ============================================================
+-- 2. シャーディング宣言（スキーマ側）
+-- ============================================================
+
+-- entity定義のシャーディング宣言で、クエリは変わらない
+-- （参考: 04_schema_definition.relschema）
+-- Order {
+--   @shard(key: .user_id, strategy: hash, count: 256, replicas: 3)
+-- }
 
 
 -- ============================================================
 -- 3. ストリーム定義
 -- ============================================================
 
--- Kafkaからのリアルタイムストリーム定義
-stream order_events from kafka("orders-events") {
-  format: json,
+stream OrderEvent from kafka("orders-events") {
   schema: {
-    order_id:   UUID,
+    order_id:  UUID,
+    user_id:   UUID,
+    amount:    Decimal(10,2),
+    currency:  String,
+    status:    String,
+    country:   String,
+    timestamp: Timestamp
+  }
+}
+
+stream UserEvent from kafka("user-events") {
+  schema: {
     user_id:    UUID,
-    amount:     Decimal(10,2),
-    currency:   String,
-    status:     String,
-    country:    String,
-    items:      List<{product_id: UUID, qty: Int, price: Decimal(10,2)}>,
+    event_type: String,
+    page_id:    String?,
     timestamp:  Timestamp
-  },
-  consumer_group: "rel-analytics",
-  offset:         "latest"
+  }
 }
 
-stream user_events from kafka("user-events") {
-  format: avro,
-  schema_registry: "http://schema-registry:8081",
-  schema: UserEvent
-}
-
-stream sensor_data from mqtt("sensors/+/temperature") {
-  format: json,
+stream SensorReading from mqtt("sensors/+/data") {
   schema: {
-    sensor_id:    String,
-    temperature:  Float,
-    humidity:     Float,
-    recorded_at:  Timestamp
+    sensor_id:   String,
+    temperature: Float,
+    humidity:    Float,
+    recorded_at: Timestamp
   }
 }
 
 
 -- ============================================================
--- 4. タンブリングウィンドウ（固定時間窓）
+-- 4. ストリームクエリ — タンブリングウィンドウ
 -- ============================================================
 
--- 1分ごとの集計（ダッシュボード向け）
-from order_events
-|> where .status == "created"
-|> window tumbling(size: 1m)
-|> group by .country
-|> select {
-     window_start:  window.start,
-     window_end:    window.end,
-     country:       .country,
-     order_count:   count(),
-     total_revenue: sum(.amount)
-   }
-|> sink kafka("revenue-by-minute") {
-     format: json
-   }
+-- 1分ごとの国別売上
+OrderEvent { status: "created" }
+  window tumbling(1m)
+  => per(.country) {
+    window_start: window.start,
+    country:      .country,
+    orders:       count(),
+    revenue:      sum(.amount)
+  }
+  -> sink kafka("revenue-by-minute")
 
 
 -- ============================================================
--- 5. スライディングウィンドウ（移動時間窓）
+-- 5. スライディングウィンドウ
 -- ============================================================
 
--- 5分間の移動窓（1分スライド）— 高額注文の検出
-from order_events
-|> window sliding(size: 5m, step: 1m)
-|> group by .user_id
-|> having sum(.amount) > 50000   -- 5分間で5万円以上
-|> select {
-     user_id:      .user_id,
-     window_start: window.start,
-     total_5min:   sum(.amount),
-     order_count:  count()
-   }
-|> sink alert_topic("high_spend_alerts")
+-- 5分間の移動窓（1分スライド）— 高額ユーザーの検出
+OrderEvent
+  window sliding(size: 5m, step: 1m)
+  => per(.user_id) {
+    user_id:  .user_id,
+    total:    sum(.amount),
+    count:    count()
+  } where total > 50000
+  -> sink kafka("high-spend-alerts")
 
 
 -- ============================================================
 -- 6. セッションウィンドウ
 -- ============================================================
 
--- ユーザーセッション（30分操作なしで終了）
-from user_events
-|> window session(gap: 30m, key: .user_id)
-|> group by .user_id
-|> select {
-     user_id:        .user_id,
-     session_start:  window.start,
-     session_end:    window.end,
-     duration_min:   window.duration / 60s,
-     event_count:    count(),
-     pages_visited:  collect(distinct .page_id),
-     converted:      any(.event_type == "purchase")
-   }
-|> sink clickhouse("user_sessions")
+UserEvent
+  window session(gap: 30m)
+  => per(.user_id) {
+    user_id:     .user_id,
+    start:       window.start,
+    end:         window.end,
+    duration:    window.duration / 60s,
+    events:      count(),
+    pages:       collect(distinct .page_id),
+    converted:   any(.event_type == "purchase")
+  }
+  -> sink clickhouse("user_sessions")
 
 
 -- ============================================================
 -- 7. ストリームとバッチの結合（Stream-Table Join）
 -- ============================================================
 
--- リアルタイムイベントと静的テーブルの結合
-from order_events
-|> enrich from products on .product_id == products.id {
-     -- productsテーブルからフィールドを取得（バッチ側）
-     product_name:     products.name,
-     category:         products.category_name,
-     price_benchmark:  products.avg_price
-   }
-|> select {
-     .order_id,
-     .user_id,
-     .product_id,
-     .product_name,
-     .category,
-     premium:  .amount > .price_benchmark * 1.5
-   }
+-- リアルタイムイベントに静的テーブルのデータを付加
+OrderEvent
+  enrich User on .user_id == user.id
+  => {
+    .order_id,
+    .user_id,
+    user.name,
+    user.country,
+    .amount,
+    .timestamp
+  }
+  -> sink clickhouse("enriched_orders")
 
 
 -- ============================================================
--- 8. ストリーム間のJOIN
+-- 8. 不正検知パイプライン
 -- ============================================================
 
--- 注文イベントとユーザーイベントを相関（5分以内）
-from order_events
-|> stream_join user_events {
-     on:     order_events.user_id == user_events.user_id,
-     window: 5m,
-     type:   inner    -- inner / left / anti
-   }
-|> where user_events.event_type == "signup"  -- 登録直後の注文
-|> select {
-     order_id:      order_events.order_id,
-     user_id:       order_events.user_id,
-     order_amount:  order_events.amount,
-     time_to_order: order_events.timestamp - user_events.timestamp
-   }
+-- バッチ側: ユーザーの通常パターン（6時間ごとに更新）
+@materialized(refresh: 6h)
+def user_baseline =
+  Order { created_at > now() - 90d } -> .user -> User
+  => per(user) {
+    user_id:       user.id,
+    avg_amount:    avg(order.amount),
+    stddev_amount: stddev(order.amount),
+    usual_country: mode(user.country)
+  }
 
-
--- ============================================================
--- 9. 不正検知パイプライン（リアルタイムML）
--- ============================================================
-
--- ユーザーの通常パターン（バッチ側・定期更新）
-@materialized(refresh: every 6h)
-query user_behavior_baseline {
-  from orders
-  |> where .created_at >= now() - 90.days
-  |> group by .user_id
-  |> select {
-       user_id:      .user_id,
-       avg_amount:   avg(.amount),
-       stddev_amount: stddev(.amount),
-       usual_country: mode(.country),
-       orders_per_day: count() / 90.0
-     }
-}
-
--- リアルタイム不正スコアリング
-from order_events
-|> enrich from user_behavior_baseline on .user_id == baseline.user_id {
-     avg_amount:     baseline.avg_amount,
-     stddev_amount:  baseline.stddev_amount,
-     usual_country:  baseline.usual_country
-   }
-|> let z_score = (.amount - .avg_amount) / (.stddev_amount + 0.01)
-|> let country_mismatch = .country != .usual_country
-|> let risk_score = z_score * 0.6 + (if country_mismatch then 1.0 else 0.0) * 0.4
-|> where risk_score > 0.8
-|> select {
-     order_id:       .order_id,
-     user_id:        .user_id,
-     amount:         .amount,
-     risk_score:     risk_score,
-     z_score:        z_score,
-     country_mismatch: country_mismatch,
-     risk_level:     if risk_score > 0.95 then "critical"
-                     else if risk_score > 0.85 then "high"
-                     else "medium"
-   }
-|> sink fraud_service("fraud-alerts") {
-     partition_by: .risk_level
-   }
+-- ストリーム側: リアルタイム検知
+OrderEvent
+  enrich user_baseline on .user_id == baseline.user_id
+  let z        = (.amount - baseline.avg_amount) / (baseline.stddev_amount + 0.01)
+  let mismatch = .country != baseline.usual_country
+  where z > 3.0 or mismatch
+  => {
+    .order_id,
+    .user_id,
+    .amount,
+    z_score:          z,
+    country_mismatch: mismatch,
+    risk_level:       z > 5.0 ? "critical" : "high"
+  }
+  -> sink fraud_service("fraud-alerts")
 
 
 -- ============================================================
--- 10. 地理空間クエリ（Geo Queries）
+-- 9. 複数シンクへの同時出力（tee）
 -- ============================================================
 
-import std.geo { distance, within_radius, cluster }
-
--- 半径5km以内の店舗を探す
-from stores
-|> where within_radius(.location, $user_location, 5.km)
-|> let dist = distance(.location, $user_location)
-|> order by dist
-|> take 10
-|> select {
-     .id,
-     .name,
-     .address,
-     distance_km: dist / 1000.0
-   }
+OrderEvent { amount > 100000 }
+  => { .order_id, .user_id, .amount, .timestamp }
+  -> tee {
+    sink kafka("high-value-orders"),
+    sink clickhouse("high_value_log"),
+    sink slack("#ops-alerts")
+  }
 
 
 -- ============================================================
--- 11. マルチリージョン集計
+-- 10. マルチリージョン集計
 -- ============================================================
 
--- グローバル集計（複数リージョンのデータを統合）
-from orders @regions(["us-east-1", "eu-west-1", "ap-northeast-1"])
-|> where .created_at >= now() - 1.days
-|> group by .region, .country
-|> select {
-     region:  .region,
-     country: .country,
-     revenue: sum(.amount),
-     orders:  count()
-   }
-|> order by .region, revenue desc
+Order @regions(["us-east-1", "eu-west-1", "ap-northeast-1"])
+  { created_at > now() - 1d }
+  => per(.region, .country) {
+    region:  .region,
+    country: .country,
+    revenue: sum(.amount),
+    orders:  count()
+  }
+  sort (.region, revenue desc)
 
 
 -- ============================================================
--- 12. ストリーム処理のシンク定義
+-- 11. 地理空間クエリ
 -- ============================================================
 
--- 複数シンクへの同時出力
-from order_events
-|> where .amount > 10000
-|> select { .order_id, .user_id, .amount, .timestamp }
-|> tee {
-     -- リアルタイムダッシュボード
-     sink kafka("high-value-orders-dashboard") { format: json },
-     -- 分析用DWH
-     sink clickhouse("high_value_orders") { batch_size: 1000 },
-     -- アラート
-     sink slack("#alerts") { template: "🚨 高額注文: {{amount}}円 ({{order_id}})" }
-   }
+import std.geo.*
+
+-- 半径5km以内の店舗
+Store
+  where within_radius(.location, $user_location, 5.km)
+  let dist = distance(.location, $user_location)
+  sort (dist asc)
+  take 10
+  => { .id, .name, .address, distance_km: dist / 1000.0 }

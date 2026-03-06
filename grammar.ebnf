@@ -1,205 +1,297 @@
 (*
- * Rel Language Grammar Specification
- * Version: 0.1.0-draft
+ * Rel Language Grammar Specification v0.2
  * Format: Extended Backus-Naur Form (EBNF)
+ *
+ * 核心原則:
+ *   SELECT / FROM / WHERE / JOIN / GROUP BY は存在しない。
+ *   代わりに:
+ *     {}  — エンティティパターン（制約）
+ *     ->  — リレーション探索
+ *     =>  — 形状抽出
+ *     per — 集計単位の宣言
  *)
+
 
 (* ===== TOP LEVEL ===== *)
 
-program         = { statement } ;
+program         = version_directive? , { statement } ;
+version_directive = "#!rel" , version , NEWLINE ;
 
-statement       = query_def
-                | entity_def
+statement       = entity_def
                 | relation_def
-                | type_alias
+                | type_def
                 | enum_def
-                | import_stmt
+                | pattern_def     (* def name = ... *)
                 | module_def
                 | migration_def
                 | stream_def
                 | transaction_def
-                | version_directive ;
-
-version_directive = "#!rel" , version_string , NEWLINE ;
-version_string    = digit , "." , digit , { "." , digit } ;
+                | report_def
+                | import_stmt ;
 
 
-(* ===== IMPORTS & MODULES ===== *)
+(* ===== IMPORT / MODULE ===== *)
 
-import_stmt     = "import" , module_path , [ import_items ] ;
-import_items    = "{" , IDENT , { "," , IDENT } , "}"
+import_stmt     = "import" , module_path , [ import_spec ] ;
+import_spec     = "{" , IDENT , { "," , IDENT } , "}"
                 | "as" , IDENT
                 | ".*" ;
 module_path     = IDENT , { "." , IDENT } ;
 
 module_def      = "module" , IDENT , "{" , { statement } , "}" ;
 
-namespace_def   = "namespace" , IDENT , "{" , { statement } , "}" ;
 
+(* ===== NAMED PATTERN DEFINITION ===== *)
 
-(* ===== QUERY DEFINITION ===== *)
+pattern_def     = [ export_kw ] , "def" , IDENT , [ params ] , "=" , query_expr ;
+export_kw       = "export" ;
 
-query_def       = { annotation } , "query" , IDENT , [ params ] , "{" , pipeline , "}" ;
-params          = "(" , [ param , { "," , param } ] , ")" ;
+params          = "(" , param , { "," , param } , ")" ;
 param           = IDENT , ":" , type_expr , [ "=" , expr ] ;
 
-pipeline        = source_clause , { pipe_op , operator } ;
-pipe_op         = "|>" ;
-source_clause   = "from" , source_expr ;
 
-source_expr     = nav_chain
-                | query_call
-                | subquery ;
+(* ===== QUERY EXPRESSION ===== *)
+(*
+ * Rel の中心的な構文。
+ * 「エンティティパターン → リレーション探索 → 抽出」の流れ。
+ *)
 
-nav_chain       = IDENT , { nav_op , IDENT } ;
-query_call      = IDENT , "(" , [ arg_list ] , ")" ;
-subquery        = "(" , pipeline , ")" ;
+query_expr      = entity_pattern , { traversal } , [ sort_clause ] , [ pagination ] , [ extraction ]
+                | named_pattern  , { traversal } , [ sort_clause ] , [ pagination ] , [ extraction ]
+                | stream_query ;
 
-nav_op          = "->"    (* INNER JOIN / has-one / belongs-to *)
-                | "-?>"   (* LEFT JOIN  / optional relation    *)
-                | "<-"    (* reverse relation                  *)
-                | "<->"   (* full outer join                   *)
-                | "~>"    (* recursive / graph traversal       *)
+(* エンティティパターン: EntityName { 制約... } *)
+entity_pattern  = IDENT , [ binding ] , [ constraint_block ] ;
+binding         = "as" , IDENT
+                | IDENT , ":" , IDENT ;   (* alias: Entity *)
+
+constraint_block = "{" , [ constraint , { "," , constraint } ] , "}" ;
+
+constraint      = field_constraint
+                | existence_check
+                | compound_constraint ;
+
+field_constraint = "." ? IDENT , constraint_op , expr
+                 | "." ? IDENT , ":" , pattern_value ;
+
+constraint_op   = ">" | "<" | ">=" | "<=" | "!=" ;
+
+pattern_value   = expr
+                | "Some"        (* Some(_) — フィールドが存在する *)
+                | "None"        (* フィールドが存在しない *)
+                | "in" , "[" , expr , { "," , expr } , "]"
+                | "~" , REGEX   (* 正規表現マッチ *)
+                | "any" ;       (* 任意の値（型チェックのみ）*)
+
+existence_check = "has" , "(" , "." IDENT , ")"   (* リレーション先が存在する *)
+                | "lacks" , "(" , "." IDENT , ")" ;
+
+compound_constraint = constraint , "|" , constraint ;  (* OR *)
+
+
+(* ===== TRAVERSAL ===== *)
+
+traversal       = nav_op , relation_name , [ binding ] , [ constraint_block ]
+                | "enrich" , named_ref , "on" , expr  (* バッチとストリームの結合 *)
                 ;
 
+nav_op          = "->"    (* 必須リレーション (INNER JOIN)  *)
+                | "-?>"   (* 任意リレーション (LEFT JOIN)   *)
+                | "<-"    (* 逆方向リレーション             *)
+                | "<->"   (* 双方向 (FULL OUTER JOIN)       *)
+                | "~>"    (* 再帰探索                       *)
+                ;
 
-(* ===== PIPELINE OPERATORS ===== *)
+relation_name   = "." , IDENT , [ depth_spec ] ;
+depth_spec      = "(" , "depth" , ":" , INT , ".." , INT , ")" ;
 
-operator        = where_op
-                | select_op
-                | group_op
-                | having_op
-                | order_op
-                | take_op
-                | navigate_op
-                | window_op
-                | let_op
-                | set_op
-                | distinct_op
-                | flatten_op
-                | cursor_paginate_op
-                | lock_op ;
+named_ref       = IDENT , { "." , IDENT } ;
+named_pattern   = named_ref , [ "(" , [ arg_list ] , ")" ] ;
 
-where_op        = "where" , expr ;
 
-select_op       = "select" , projection ;
-projection      = field_access
-                | struct_literal
-                | "*" ;
+(* ===== EXTRACTION ===== *)
+(*
+ * => shape
+ * => per(binding) { aggregation_shape }
+ *)
 
-group_op        = "group" , "by" , group_key , { "," , group_key } ;
-group_key       = IDENT , ":" , field_access
-                | field_access ;
+extraction      = "=>" , extract_expr ;
 
-having_op       = "having" , expr ;
+extract_expr    = shape_expr                          (* 単純な形状抽出       *)
+                | aggregate_expr                      (* 集計付き抽出          *)
+                ;
 
-order_op        = "order" , "by" , order_term , { "," , order_term } ;
+shape_expr      = "." ,                              (* 全フィールド          *)
+                | "{" , shape_field , { "," , shape_field } , "}"
+                | "[" , "{" , shape_field , { "," , shape_field } , "}" , "]"  (* リスト *)
+                ;
+
+shape_field     = "." IDENT                          (* フィールドそのまま    *)
+                | IDENT , ":" , expr                 (* 名前付き              *)
+                | IDENT , ":" , "." IDENT , "=>" , shape_expr  (* ネスト       *)
+                | "..." , IDENT                      (* スプレッド            *)
+                ;
+
+aggregate_expr  = "per" , "(" , agg_key , { "," , agg_key } , ")" ,
+                  "{" , agg_field , { "," , agg_field } , "}" ,
+                  [ "where" , expr ]                 (* 集計後フィルタ        *)
+                ;
+
+agg_key         = entity_ref                         (* per(user) など        *)
+                | "." IDENT                          (* per(.country) など    *)
+                ;
+
+entity_ref      = IDENT ;                            (* バインドされたエンティティ名 *)
+
+agg_field       = "." IDENT                          (* グループキーフィールド *)
+                | entity_ref , "." , IDENT           (* エンティティフィールド *)
+                | IDENT , ":" , agg_expr             (* 集計式                *)
+                ;
+
+agg_expr        = agg_func , "(" , [ agg_arg ] , ")"
+                | expr ;                             (* グループキーの直接参照 *)
+
+agg_func        = "count" | "sum" | "avg" | "min" | "max"
+                | "median" | "stddev" | "variance"
+                | "collect" | "first" | "last"
+                | "any" | "all" | "mode"
+                | "rank" | "dense_rank" | "row_number"
+                | "lag" | "lead" ;
+
+agg_arg         = [ "distinct" ] , [ expr ] ;
+
+
+(* ===== WINDOW FUNCTIONS ===== *)
+
+window_spec     = agg_func , "()" , "over" , entity_ref , [ "by" , order_term , { "," , order_term } ] ;
+
+
+(* ===== SORT & PAGINATION ===== *)
+
+sort_clause     = "sort" , "(" , order_term , { "," , order_term } , ")" ;
 order_term      = expr , [ "asc" | "desc" ] , [ "nulls" , ( "first" | "last" ) ] ;
 
-take_op         = "take" , expr , [ "skip" , expr ] ;
+pagination      = take_clause
+                | cursor_clause ;
 
-navigate_op     = "navigate" , nav_expr , [ "as" , IDENT ] ;
-nav_expr        = "." , IDENT , nav_op
-                | IDENT , nav_op , IDENT ;
-
-window_op       = "window" , "{" , window_field , { "," , window_field } , "}" ;
-window_field    = IDENT , ":" , agg_call , "over" , "(" , window_spec , ")" ;
-window_spec     = [ partition_clause ] , [ order_clause ] , [ frame_clause ] ;
-partition_clause = "partition" , "by" , expr , { "," , expr } ;
-order_clause    = "order" , "by" , order_term , { "," , order_term } ;
-frame_clause    = ( "rows" | "range" ) , frame_bound , "to" , frame_bound ;
-frame_bound     = "unbounded" , "preceding"
-                | expr , "preceding"
-                | "current" , "row"
-                | expr , "following"
-                | "unbounded" , "following" ;
-
-let_op          = "let" , IDENT , "=" , expr ;
-
-distinct_op     = "distinct" , [ "by" , expr , { "," , expr } ] ;
-
-flatten_op      = "flatten" , [ "." , IDENT ] ;
-
-cursor_paginate_op = "cursor_paginate" , "{" ,
-                       "after" , ":" , expr , ","
-                       "per_page" , ":" , expr ,
-                     "}" ;
-
-lock_op         = "lock" , "(" , "for" , ":" , ( "read" | "update" | "share" ) , ")" ;
-
-set_op          = "set" , "{" , set_field , { "," , set_field } , "}" ;
-set_field       = "." , IDENT , ":" , expr ;
+take_clause     = "take" , expr , [ "," , "skip" , expr ] ;
+cursor_clause   = "after" , STRING , NEWLINE , "take" , expr ;
 
 
-(* ===== EXPRESSIONS ===== *)
+(* ===== SINGLE-RECORD RETRIEVAL ===== *)
 
-expr            = or_expr ;
-or_expr         = and_expr , { "or" , and_expr } ;
-and_expr        = not_expr , { "and" , not_expr } ;
-not_expr        = [ "not" ] , compare_expr ;
-compare_expr    = add_expr , { compare_op , add_expr } ;
-compare_op      = "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "not" , "in" | "like" ;
-add_expr        = mul_expr , { ( "+" | "-" | "++" ) , mul_expr } ;
-mul_expr        = unary_expr , { ( "*" | "/" | "%" ) , unary_expr } ;
-unary_expr      = [ "-" | "not" ] , postfix_expr ;
-postfix_expr    = primary_expr , { postfix_op } ;
-postfix_op      = "." , IDENT                    (* field access      *)
-                | "?." , IDENT                   (* optional chaining *)
-                | "(" , [ arg_list ] , ")"       (* function call     *)
-                | "[" , expr , "]"               (* index access      *)
-                | "??" , expr                    (* null coalescing   *)
-                | "!"                            (* unwrap / assert   *)
+single_op       = "one"    (* 必ず1件。0件/複数件はエラー *)
+                | "first"  (* 最初の1件。なければ None    *)
+                | "last" ;
+
+
+(* ===== WRITE OPERATIONS ===== *)
+
+write_stmt      = create_stmt
+                | update_stmt
+                | delete_stmt
+                | upsert_stmt ;
+
+create_stmt     = "create" , IDENT , record_literal
+                | "create" , IDENT , "[*]" , "[" , record_literal , { "," , record_literal } , "]" ;
+
+update_stmt     = entity_pattern , "update" , record_literal ;
+
+delete_stmt     = entity_pattern , "delete" ;
+
+upsert_stmt     = entity_pattern , "upsert" , record_literal ,
+                  [ "on_create" , record_literal ] ;
+
+
+(* ===== TRANSACTION ===== *)
+
+transaction_def = "transaction" , IDENT , "{" ,
+                    [ "isolation" , ":" , isolation_level , "," ] ,
+                    [ "timeout" , ":" , duration , "," ] ,
+                    [ "retry" , ":" , INT ] ,
+                    { tx_stmt }
+                  "}" ;
+
+isolation_level = "ReadCommitted" | "RepeatableRead" | "Serializable" ;
+
+tx_stmt         = let_stmt
+                | write_stmt
+                | guard_stmt
+                | return_stmt
+                | await_stmt ;
+
+let_stmt        = "let" , IDENT , "=" , ( query_expr | expr ) ;
+guard_stmt      = "guard" , expr , "else" , expr ;
+return_stmt     = "return" , record_literal ;
+await_stmt      = "await" , call_expr ;
+
+
+(* ===== SCHEMA DEFINITION ===== *)
+
+entity_def      = [ annotation* ] , "entity" , IDENT ,
+                  [ "extends" , IDENT ] ,
+                  "{" , { field_def | entity_annotation } , "}" ;
+
+field_def       = IDENT , ":" , type_expr , { field_modifier } ;
+
+field_modifier  = "=" , expr            (* デフォルト値 *)
+                | "required"
+                | "unique"
+                | "indexed"
+                | "auto_update"
+                | "immutable"
+                | "encrypted"
+                | "deprecated"
+                | "computed" , "(" , expr , ")"
+                | "check" , "(" , expr , ")"
+                | "lock" , "(" , lock_mode , ")"
                 ;
 
-primary_expr    = literal
-                | field_access
-                | struct_literal
-                | list_literal
-                | map_literal
-                | call_expr
-                | if_expr
-                | match_expr
-                | lambda_expr
-                | "(" , expr , ")"
-                | IDENT ;
+lock_mode       = "read" | "write" | "share" ;
 
-field_access    = "." , IDENT , { "." , IDENT } ;
+entity_annotation = "index" , "[" , IDENT , { "," , IDENT } , "]"
+                  | "check" , "(" , expr , ")"
+                  | "@shard" , "(" , shard_opts , ")"
+                  | "@materialized" , "(" , refresh_opts , ")"
+                  ;
 
-struct_literal  = "{" , [ struct_field , { "," , struct_field } ] , "}" ;
-struct_field    = IDENT , ":" , expr
-                | "." , IDENT           (* shorthand: .name = name: .name *)
-                | "..." , expr ;         (* spread *)
+shard_opts      = shard_opt , { "," , shard_opt } ;
+shard_opt       = "key" , ":" , "." IDENT
+                | "strategy" , ":" , ("hash" | "range" | "list")
+                | "count" , ":" , INT
+                | "replicas" , ":" , INT ;
 
-list_literal    = "[" , [ expr , { "," , expr } ] , "]" ;
+refresh_opts    = "refresh" , ":" , duration ;
 
-map_literal     = "Map" , "{" , [ map_entry , { "," , map_entry } ] , "}" ;
-map_entry       = expr , ":" , expr ;
 
-call_expr       = IDENT , "(" , [ arg_list ] , ")" ;
-arg_list        = arg , { "," , arg } ;
-arg             = [ IDENT , ":" ] , expr ;
+(* ===== RELATION DEFINITION ===== *)
 
-if_expr         = "if" , expr , "then" , expr , "else" , expr ;
+relation_def    = IDENT , "->" , IDENT , "->" , IDENT , cardinality ,
+                  "via" , via_spec ,
+                  [ "where" , constraint_block ] ,
+                  [ "sort" , order_term ]
+                | IDENT , "<->" , IDENT , "->" , IDENT , "[*]" ,
+                  "via" , IDENT , "{" , via_field , { "," , via_field } , "}"
+                ;
 
-match_expr      = "match" , expr , "{" , match_arm , { match_arm } , "}" ;
-match_arm       = pattern , "=>" , expr , "," ;
-pattern         = "_"
-                | literal
-                | IDENT
-                | IDENT , "(" , [ IDENT , { "," , IDENT } ] , ")"
-                | "Some" , "(" , IDENT , ")"
-                | "None" ;
+cardinality     = "" | "[*]" | "?" ;
 
-lambda_expr     = "|" , [ lambda_params ] , "|" , expr ;
-lambda_params   = IDENT , { "," , IDENT } ;
+via_spec        = IDENT                  (* フィールド名 *)
+                | "(" , IDENT , "," , IDENT , ")"  (* ポリモーフィック *)
+                ;
 
-agg_call        = agg_func , "(" , [ agg_arg ] , ")" ;
-agg_func        = "count" | "sum" | "avg" | "min" | "max"
-                | "stddev" | "variance" | "median"
-                | "collect" | "first" | "last"
-                | "rank" | "dense_rank" | "row_number"
-                | "lag" | "lead" | "nth_value" ;
-agg_arg         = [ "distinct" ] , [ expr ] ;
+via_field       = IDENT , ":" , "->" , IDENT , "." , IDENT ;
+
+
+(* ===== TYPE DEFINITIONS ===== *)
+
+type_def        = "type" , IDENT , "=" , type_expr , { field_modifier } ;
+
+enum_def        = "enum" , IDENT , "{" , enum_variant , { "," , enum_variant } , "}" ;
+
+enum_variant    = IDENT
+                | IDENT , "{" , field_def , { "," , field_def } , "}"  (* データ付きバリアント *)
+                ;
 
 
 (* ===== TYPE EXPRESSIONS ===== *)
@@ -210,175 +302,141 @@ type_expr       = base_type
                 | set_type
                 | map_type
                 | tuple_type
-                | union_type
-                | struct_type
-                | stream_type ;
+                | record_type
+                | union_type ;
 
 base_type       = IDENT , [ "(" , INT , [ "," , INT ] , ")" ] ;
 option_type     = type_expr , "?" ;
 list_type       = "List" , "<" , type_expr , ">" ;
 set_type        = "Set" , "<" , type_expr , ">" ;
 map_type        = "Map" , "<" , type_expr , "," , type_expr , ">" ;
-tuple_type      = "(" , type_expr , "," , type_expr , { "," , type_expr } , ")" ;
+tuple_type      = "(" , type_expr , { "," , type_expr } , ")" ;
+record_type     = "{" , field_def , { "," , field_def } , "}" ;
 union_type      = type_expr , "|" , type_expr ;
-struct_type     = "{" , type_field , { "," , type_field } , "}" ;
-type_field      = IDENT , ":" , type_expr ;
-stream_type     = "Stream" , "<" , type_expr , ">" ;
 
 
-(* ===== ENTITY DEFINITION ===== *)
+(* ===== EXPRESSIONS ===== *)
 
-entity_def      = { annotation } , "entity" , IDENT , [ "extends" , IDENT ] , "{"
-                    { field_def | entity_annotation }
-                  "}" ;
-
-field_def       = IDENT , ":" , type_expr , { annotation } ;
-
-entity_annotation = "@index" , "(" , "[" , IDENT , { "," , IDENT } , "]" , ")"
-                  | "@check" , "(" , expr , ")"
-                  | "@shard" , "(" , shard_config , ")" ;
-
-shard_config    = shard_option , { "," , shard_option } ;
-shard_option    = "strategy" , ":" , ( "hash" | "range" | "list" )
-                | "key" , ":" , field_access
-                | "count" , ":" , INT
-                | "replicas" , ":" , INT ;
-
-
-(* ===== RELATION DEFINITION ===== *)
-
-relation_def    = "relation" , IDENT , "." , IDENT ,
-                  nav_op , IDENT , [ "?" ] ,
-                  [ "via" , via_spec ] ,
-                  [ "where" , expr ] ,
-                  [ "order" , "by" , order_term , { "," , order_term } ] ;
-
-via_spec        = IDENT                             (* foreign key field  *)
-                | IDENT , "{" , via_field , { "," , via_field } , "}"  (* join table *)
-                | "(" , IDENT , "," , IDENT , ")"  (* polymorphic        *)
+expr            = or_expr ;
+or_expr         = and_expr , { ("or" | "||") , and_expr } ;
+and_expr        = not_expr , { ("and" | "&&") , not_expr } ;
+not_expr        = [ "not" | "!" ] , compare_expr ;
+compare_expr    = add_expr , { cmp_op , add_expr } ;
+cmp_op          = "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "not" , "in" ;
+add_expr        = mul_expr , { ("+" | "-" | "++") , mul_expr } ;
+mul_expr        = unary_expr , { ("*" | "/" | "//" | "%") , unary_expr } ;
+unary_expr      = [ "-" | "not" ] , postfix_expr ;
+postfix_expr    = primary_expr , { postfix } ;
+postfix         = "." , IDENT                   (* フィールドアクセス *)
+                | "?." , IDENT                  (* オプショナルチェーン *)
+                | "[" , expr , "]"              (* インデックス *)
+                | "(" , [ arg_list ] , ")"      (* 関数呼び出し *)
+                | "??" , expr                   (* null合体 *)
+                | "!"                           (* 強制アンラップ *)
+                | "match" , "{" , { match_arm } , "}"
                 ;
 
-via_field       = IDENT , ":" , IDENT , "->" , IDENT , "." , IDENT ;
+primary_expr    = literal
+                | "$" , IDENT                   (* パラメータ *)
+                | "." , IDENT                   (* フィールド参照（現在スコープ） *)
+                | IDENT                         (* 変数 *)
+                | record_literal
+                | list_literal
+                | "(" , expr , ")"
+                | if_expr
+                | lambda_expr
+                | call_expr ;
+
+record_literal  = "{" , [ rec_field , { "," , rec_field } ] , "}" ;
+rec_field       = IDENT , ":" , expr
+                | "." , IDENT                  (* 省略記法: .name = name: .name *)
+                | "..." , IDENT ;              (* スプレッド *)
+
+list_literal    = "[" , [ expr , { "," , expr } ] , "]" ;
+
+call_expr       = IDENT , "(" , [ arg_list ] , ")" ;
+arg_list        = arg , { "," , arg } ;
+arg             = [ IDENT , ":" ] , expr ;
+
+if_expr         = expr , "?" , expr , ":" , expr ;   (* 三項演算子 *)
+
+match_expr      = expr , "match" , "{" , match_arm , { match_arm } , "}" ;
+match_arm       = pattern , "=>" , expr , "," ;
+pattern         = "_"
+                | literal
+                | IDENT
+                | IDENT , "{" , IDENT , { "," , IDENT } , "}"  (* ADTバリアント *)
+                | "Some" , "(" , IDENT , ")"
+                | "None" ;
+
+lambda_expr     = "|" , [ IDENT , { "," , IDENT } ] , "|" , expr ;
 
 
-(* ===== TYPE ALIASES ===== *)
+(* ===== LITERALS ===== *)
 
-type_alias      = "type" , IDENT , "=" , type_expr , { annotation } ;
+literal         = INT | FLOAT | DECIMAL | STRING | BOOL | "None" | duration ;
 
+INT             = digit , { digit } ;
+FLOAT           = digit , { digit } , "." , digit , { digit } ;
+DECIMAL         = INT , "." , digit , { digit } , "m" ;
+STRING          = '"' , { any_char } , '"' ;
+BOOL            = "true" | "false" ;
+REGEX           = "/" , { any_char } , "/" , [ regex_flags ] ;
+regex_flags     = { "i" | "g" | "m" } ;
+duration        = INT , duration_unit ;
+duration_unit   = "ms" | "s" | "m" | "h" | "d" | "w" ;
 
-(* ===== ENUM DEFINITION ===== *)
+IDENT           = (letter | "_") , { letter | digit | "_" } ;
+letter          = "a".."z" | "A".."Z" ;
+digit           = "0".."9" ;
 
-enum_def        = "enum" , IDENT , "{" , enum_variant , { enum_variant } , "}" ;
-enum_variant    = IDENT , [ "=" , ( STRING | INT ) ] ;
-
-
-(* ===== ANNOTATIONS ===== *)
-
-annotation      = "@" , IDENT , [ "(" , annotation_args , ")" ] ;
-annotation_args = annotation_arg , { "," , annotation_arg } ;
-annotation_arg  = [ IDENT , ":" ] , annotation_value ;
-annotation_value = expr | type_expr ;
-
-
-(* ===== MIGRATION DEFINITION ===== *)
-
-migration_def   = "migration" , IDENT , "{" ,
-                    "version" , ":" , STRING , ","
-                    [ "description" , ":" , STRING , "," ]
-                    "up" , "{" , { ddl_stmt } , "}" ,
-                    "down" , "{" , { ddl_stmt } , "}"
-                  "}" ;
-
-ddl_stmt        = alter_entity
-                | add_index_stmt
-                | drop_index_stmt ;
-
-alter_entity    = "alter" , IDENT , "{" , { alter_field } , "}" ;
-alter_field     = "add" , field_def
-                | "drop" , IDENT
-                | "rename" , IDENT , "to" , IDENT
-                | "modify" , IDENT , ":" , type_expr ;
-
-add_index_stmt  = "add_index" , IDENT , "." , IDENT ;
-drop_index_stmt = "drop_index" , IDENT , "." , IDENT ;
+(* コメント: -- 行末まで、または /* ... */ *)
 
 
 (* ===== STREAM DEFINITION ===== *)
 
 stream_def      = "stream" , IDENT , "from" , stream_source , "{" ,
-                    "format" , ":" , ( "json" | "avro" | "protobuf" ) , ","
-                    "schema" , ":" , ( type_expr | IDENT )
+                    "schema" , ":" , ( type_expr | IDENT ) ,
+                    [ stream_opts ]
                   "}" ;
 
 stream_source   = "kafka" , "(" , STRING , ")"
                 | "kinesis" , "(" , STRING , ")"
-                | "mqtt" , "(" , STRING , ")"
-                | "http_sse" , "(" , STRING , ")" ;
+                | "mqtt" , "(" , STRING , ")" ;
+
+stream_opts     = { stream_opt , "," } ;
+stream_opt      = "format" , ":" , ("json" | "avro" | "protobuf")
+                | "consumer_group" , ":" , STRING
+                | "offset" , ":" , ("earliest" | "latest" | INT) ;
+
+stream_query    = stream_pattern , { stream_op } , [ stream_sink ] ;
+
+stream_pattern  = IDENT , [ constraint_block ] ;
+
+stream_op       = "window" , window_type
+                | "enrich" , named_ref , "on" , expr
+                | "let" , IDENT , "=" , expr ;
+
+window_type     = "tumbling" , "(" , duration , ")"
+                | "sliding"  , "(" , duration , "," , duration , ")"
+                | "session"  , "(" , "gap" , ":" , duration , ")" ;
+
+stream_sink     = "->" , "sink" , IDENT , [ "{" , { stream_opt } , "}" ] ;
 
 
-(* ===== TRANSACTION DEFINITION ===== *)
+(* ===== MIGRATION ===== *)
 
-transaction_def = "transaction" , IDENT , "{" ,
-                    [ transaction_option , { "," , transaction_option } ]
-                    "steps" , "{" , { tx_stmt } , "}"
+migration_def   = "migration" , STRING , "{" ,
+                    "up"   , "{" , { migration_op } , "}" ,
+                    "down" , "{" , { migration_op } , "}"
                   "}" ;
 
-transaction_option = "isolation" , ":" , isolation_level
-                   | "timeout" , ":" , duration_lit
-                   | "retry" , ":" , INT ;
-
-isolation_level = "read_committed" | "repeatable_read" | "serializable" ;
-
-tx_stmt         = let_stmt
-                | insert_stmt
-                | update_stmt
-                | delete_stmt
-                | guard_stmt
-                | await_stmt
-                | return_stmt ;
-
-let_stmt        = "let" , IDENT , "=" , expr ;
-insert_stmt     = "insert" , IDENT , struct_literal ;
-update_stmt     = "update" , IDENT , "|>" , where_op , "|>" , set_op ;
-delete_stmt     = "delete" , IDENT , "|>" , where_op ;
-guard_stmt      = "guard" , expr , "else" , expr ;
-await_stmt      = "await" , call_expr ;
-return_stmt     = "return" , expr ;
+migration_op    = "create" , IDENT
+                | "drop" , IDENT
+                | IDENT , "+=" , "{" , field_def , { "," , field_def } , "}"
+                | IDENT , "-=" , IDENT ;
 
 
-(* ===== LITERALS ===== *)
+(* ===== REPORT ===== *)
 
-literal         = INT
-                | FLOAT
-                | DECIMAL
-                | STRING
-                | BOOL
-                | NULL
-                | uuid_lit
-                | duration_lit
-                | date_lit
-                | time_lit
-                | timestamp_lit ;
-
-INT             = digit , { digit } ;
-FLOAT           = digit , { digit } , "." , digit , { digit } , [ exponent ] ;
-DECIMAL         = digit , { digit } , "." , digit , { digit } , "m" ;
-STRING          = '"' , { char } , '"' ;
-BOOL            = "true" | "false" ;
-NULL            = "None" ;
-uuid_lit        = "UUID" , "(" , STRING , ")" ;
-duration_lit    = INT , ( "ms" | "s" | "m" | "h" | "d" | "w" ) ;
-date_lit        = "Date" , "(" , STRING , ")" ;
-time_lit        = "Time" , "(" , STRING , ")" ;
-timestamp_lit   = "Timestamp" , "(" , STRING , ")" ;
-
-exponent        = ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ;
-
-IDENT           = letter , { letter | digit | "_" } ;
-letter          = "A" | ... | "Z" | "a" | ... | "z" | "_" ;
-digit           = "0" | ... | "9" ;
-NEWLINE         = "\n" | "\r\n" ;
-
-(* ===== COMMENTS ===== *)
-(* Line comment:  -- this is a comment  *)
-(* Block comment: /* this is a comment */ *)
+report_def      = "@report" , IDENT , [ params ] , "{" , { tx_stmt } , "}" ;
